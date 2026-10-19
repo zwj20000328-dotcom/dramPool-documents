@@ -1,0 +1,192 @@
+# A2 HIXL Host-Sync Mock Patch
+# Base: upstream/develop e7375fcd + PR #1394 b0c29266
+#
+# Purpose: A2 (910B3) does not support HIXL native async transfers
+#          (TransferAsync + GetTransferStatus polling). This patch mocks
+#          them by executing transfers synchronously with <=32 KiB chunking.
+#
+# Changes (2 files, HIXL transport only):
+#   hixl_instance.h   - add async result tracking members
+#   hixl_instance.cpp  - mock TransferAsync (sync exec + fake handle),
+#                        mock GetTransferStatus (result lookup),
+#                        chunk TransferSync to <=32 KiB segments
+#
+# Apply: git apply a2_hixl_host_sync_mock.patch
+# Or:    patch -p1 < a2_hixl_host_sync_mock.patch
+
+--- a/ucm/transport/p2p/src/protocols/hixl/hixl_instance.h
++++ b/ucm/transport/p2p/src/protocols/hixl/hixl_instance.h
+@@ -23,6 +23,7 @@
+  * */
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
+@@ -87,6 +88,11 @@
+     std::deque<QueuedTask> tasks_;
+     bool stopping_ = false;
+     bool initialized_ = false;
++
++    // A2 host-sync fallback: async transfers are executed synchronously and
++    // results are stored for GetTransferStatus polling.
++    std::atomic<uint64_t> next_fake_request_{1};
++    std::map<hixl::TransferReq, TransferStatus> async_results_;
+ };
+ 
+ }  // namespace transport
+--- a/ucm/transport/p2p/src/protocols/hixl/hixl_instance.cpp
++++ b/ucm/transport/p2p/src/protocols/hixl/hixl_instance.cpp
+@@ -31,7 +31,7 @@
+ namespace transport {
+ namespace {
+ 
+-std::vector<hixl::TransferOpDesc> BuildTransferOpDesc(const std::vector<Segment>& segments)
++[[maybe_unused]] std::vector<hixl::TransferOpDesc> BuildTransferOpDesc(const std::vector<Segment>& segments)
+ {
+     std::vector<hixl::TransferOpDesc> descs;
+     descs.reserve(segments.size());
+@@ -252,19 +252,36 @@
+                                   const std::vector<Segment>& segments, int32_t timeout_ms)
+ {
+     return Run([&](hixl::Hixl& engine) {
+-        const auto descs = BuildTransferOpDesc(segments);
++        // A2 host-sync fallback: single segments > 32 KiB fail with ts error 507001,
++        // so split every segment into <=32 KiB chunks and issue them sequentially.
++        constexpr std::size_t kMaxSyncSegmentBytes = 32 * 1024;
+         const auto operation = opcode == Opcode::Read ? hixl::READ : hixl::WRITE;
+-        const auto native_status =
+-            engine.TransferSync(remote_engine.c_str(), operation, descs, timeout_ms);
+-        if (native_status != hixl::SUCCESS) {
+-            return Status::Error(fmt::format("TransferSync({}, ops={}, timeout_ms={}) returned {}",
+-                                             remote_engine, descs.size(), timeout_ms,
+-                                             static_cast<int>(native_status)));
+-        }
+-        UC_DEBUG(
+-            "[Transport][HIXL] synchronous transfer completed: engine={} remote_engine={} "
+-            "opcode={} segments={}",
+-            local_endpoint_.ToString(), remote_engine, static_cast<int>(opcode), descs.size());
++        for (const auto& segment : segments) {
++            const auto* local = static_cast<const std::uint8_t*>(segment.local_addr);
++            auto remote = segment.remote_addr;
++            auto remaining = segment.length;
++            while (remaining > 0) {
++                const auto chunk = std::min(remaining, kMaxSyncSegmentBytes);
++                const std::vector<hixl::TransferOpDesc> descs{
++                    hixl::TransferOpDesc{
++                        reinterpret_cast<uintptr_t>(local),
++                        static_cast<uintptr_t>(remote),
++                        static_cast<size_t>(chunk),
++                    },
++                };
++                const auto native_status =
++                    engine.TransferSync(remote_engine.c_str(), operation, descs, timeout_ms);
++                if (native_status != hixl::SUCCESS) {
++                    return Status::Error(fmt::format(
++                        "TransferSync({}, chunk={} of segment_bytes={}, timeout_ms={}) returned {}",
++                        remote_engine, chunk, segment.length, timeout_ms,
++                        static_cast<int>(native_status)));
++                }
++                local += chunk;
++                remote += chunk;
++                remaining -= chunk;
++            }
++        }
+         return Status::OK();
+     });
+ }
+@@ -272,47 +289,60 @@
+ Status HixlInstance::TransferAsync(const std::string& remote_engine, Opcode opcode,
+                                    const std::vector<Segment>& segments, hixl::TransferReq& request)
+ {
+-    hixl::TransferReq native_request = nullptr;
++    // A2 host-sync fallback: execute the transfer synchronously with <=32 KiB
++    // chunking, store the result, and return a fake handle. GetTransferStatus
++    // will look up the stored result so the async polling API works unchanged.
++    request = nullptr;
+     const auto status = Run([&](hixl::Hixl& engine) {
+-        const auto descs = BuildTransferOpDesc(segments);
+-        hixl::TransferArgs args;
++        constexpr std::size_t kMaxSyncSegmentBytes = 32 * 1024;
+         const auto operation = opcode == Opcode::Read ? hixl::READ : hixl::WRITE;
+-        const auto native_status =
+-            engine.TransferAsync(remote_engine.c_str(), operation, descs, args, native_request);
+-        if (native_status != hixl::SUCCESS || native_request == nullptr) {
+-            return Status::Error(fmt::format("TransferAsync({}, ops={}) returned {} request={}",
+-                                             remote_engine, descs.size(),
+-                                             static_cast<int>(native_status), native_request));
+-        }
+-        UC_DEBUG(
+-            "[Transport][HIXL] asynchronous transfer submitted: engine={} remote_engine={} "
+-            "opcode={} segments={} request={}",
+-            local_endpoint_.ToString(), remote_engine, static_cast<int>(opcode), descs.size(),
+-            native_request);
+-        return Status::OK();
+-    });
+-    if (status == Status::OK()) { request = native_request; }
++        for (const auto& segment : segments) {
++            const auto* local = static_cast<const std::uint8_t*>(segment.local_addr);
++            auto remote = segment.remote_addr;
++            auto remaining = segment.length;
++            while (remaining > 0) {
++                const auto chunk = std::min(remaining, kMaxSyncSegmentBytes);
++                const std::vector<hixl::TransferOpDesc> descs{
++                    hixl::TransferOpDesc{
++                        reinterpret_cast<uintptr_t>(local),
++                        static_cast<uintptr_t>(remote),
++                        static_cast<size_t>(chunk),
++                    },
++                };
++                const auto native_status =
++                    engine.TransferSync(remote_engine.c_str(), operation, descs, 10000);
++                if (native_status != hixl::SUCCESS) {
++                    return Status::Error(fmt::format(
++                        "A2-sync TransferAsync({}, chunk={} of segment_bytes={}) returned {}",
++                        remote_engine, chunk, segment.length,
++                        static_cast<int>(native_status)));
++                }
++                local += chunk;
++                remote += chunk;
++                remaining -= chunk;
++            }
++        }
++        return Status::OK();
++    });
++
++    const auto fake_request = reinterpret_cast<hixl::TransferReq>(
++        static_cast<uintptr_t>(next_fake_request_.fetch_add(1)));
++    async_results_[fake_request] = status.Success() ? TransferStatus::Completed
++                                                     : TransferStatus::Failed;
++    request = fake_request;
+     return status;
+ }
+ 
+ Status HixlInstance::GetTransferStatus(hixl::TransferReq request, TransferStatus& status)
+ {
++    // A2 host-sync fallback: look up the pre-computed result from TransferAsync.
+     status = TransferStatus::Failed;
+-    return Run([&](hixl::Hixl& engine) {
+-        hixl::TransferStatus native_transfer_status = hixl::TransferStatus::WAITING;
+-        const auto native_status = engine.GetTransferStatus(request, native_transfer_status);
+-        if (native_status != hixl::SUCCESS) {
+-            return Status::Error(fmt::format("GetTransferStatus(req={}) returned {}", request,
+-                                             static_cast<int>(native_status)));
+-        }
+-        switch (native_transfer_status) {
+-            case hixl::TransferStatus::WAITING: status = TransferStatus::Waiting; break;
+-            case hixl::TransferStatus::COMPLETED: status = TransferStatus::Completed; break;
+-            case hixl::TransferStatus::FAILED:
+-            case hixl::TransferStatus::TIMEOUT: status = TransferStatus::Failed; break;
+-        }
+-        return Status::OK();
+-    });
++    const auto it = async_results_.find(request);
++    if (it != async_results_.end()) {
++        status = it->second;
++        return Status::OK();
++    }
++    return Status::Error(fmt::format("GetTransferStatus(req={}) unknown fake request", request));
+ }
+ 
+ const Endpoint& HixlInstance::LocalEndpoint() const { return local_endpoint_; }
