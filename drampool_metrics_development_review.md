@@ -1,6 +1,7 @@
 # DramPool Metrics 开发流程总结
 
-> 覆盖区间：2026-09-17 ~ 2026-10-16 ｜ 分支 `z00984767-0917` ｜ 报告日期：2026-10-16
+> 覆盖区间：2026-09-17 ~ 2026-10-16 ｜ 分支 `z00984767-0917` ｜ 初版 2026-10-16，第 3 章改写于 2026-10-21
+> 代码基线：初版核验于 `afdcbda6`；改写时分支已前进到 `e6717d04`（2026-10-20），**但 `ucm/store/dram/cc/drampool/` 下所有埋点文件自 `afdcbda6` 起零改动**，故第 1–4 章的代码结论仍然成立。期间新增的一处框架修复（`7164b731`，metrics 双缓冲竞争）已补入 §3.2.1。
 > 素材来源：24 个会话转录、仓库代码（`ucm/store/dram/cc/drampool/`）、以及 `dramPool_documents/` 下的设计/联调文档。
 > 本文所有代码结论均标注 `file:line`；所有历史结论均标注会话 id、提交号或文档出处。**指标名、PromQL、错误码、配置键保持英文原文。**
 
@@ -58,6 +59,8 @@ DramPool 进程(C++)                UCM/vLLM 进程(Python)
 | **C5** | 线程级双缓冲，首次 `UpdateStats` 的线程自动注册 | 各 worker 线程直接调用即可，无需手工登记 |
 
 采集方案选型上，Handler 方案（位置编码 + `/` 分割）与 MetricsSlot 方案（全局固定数组 + 锁）均被否决，理由是"字段位置编码易错位"与"Histogram 更新存在锁竞争"；最终采用 **UCM thread-local + 双 buffer**（设计文档 §2.1）。
+
+> **关于 C5 的一个后续事实**：这套双缓冲的"写线程 ↔ 收集线程"握手最初用 acquire/release，在 x86 上存在真实竞争（收集线程会在写线程尚未写完时读取并清空同一缓冲），会导致 metrics 模块内部段错误；2026-10-16 已改为 `seq_cst`（`7164b731`）。这也是为什么 A2/A3 的 Ascend 联调从未撞到它——aarch64 的 `stlr`/`ldar` 天然保序。完整的问题与验证见 §3.2.1。
 
 ### 1.2 设计原则：S0–S4 判定标准
 
@@ -172,7 +175,7 @@ SPSC 队列没有 size 查询接口，且 gauge 只能被单线程写（thread-l
 
 统一后 `kMsBucketsPrepare` / `kMsBucketsTransfer` / `kMsBucketsLookupBatch` 三者**内容完全相同**但仍保留为三个独立数组（判定为无害的历史冗余，未合并；要合并需先确认它们被期望永久对齐）。
 
-> 一个值得记住的机制（来自一次历史 bug）：框架的 `NormalizeBuckets` **只追加 `+Inf`、没有默认桶集**（`metrics.cc:31-38`）。所以直方图注册时**必须显式传桶数组**，否则不会退化成粗粒度直方图，而是**只有一行 `+Inf`、完全没有分辨率**——该 bug 曾让热力图整块空白（详见 §3.6-㉔）。
+> 一个值得记住的机制（来自一次历史 bug）：框架的 `NormalizeBuckets` **只追加 `+Inf`、没有默认桶集**（`metrics.cc:31-38`）。所以直方图注册时**必须显式传桶数组**，否则不会退化成粗粒度直方图，而是**只有一行 `+Inf`、完全没有分辨率**——该 bug 曾让热力图整块空白（详见 §3.1.1）。
 
 时钟精度：新增 `SteadyNowUs()`（µs，`drampool_types.h`）。原因是 metadata 单次操作是微秒量级，毫秒时钟下直方图会退化成 0/1 两值。所有 Histogram 内部以 µs 计时、以 **ms（double）** 入直方图，指标名统一 `_ms` 后缀。
 
@@ -207,7 +210,7 @@ gc.enabled (默认 true)                    → 唯一的 F 组 gauge 生产者
 | `drampool_load_miss_entries_total` | Counter | LOAD 中**未取到数据**的 entry 数 = LoadBegin 失败 + 请求长度大于存储长度 | 读取未命中规模 | 突增 = 读到了被驱逐/过期/未写完的数据。**注意命中率算不出来**（见 §4.2） |
 | `drampool_lookup_miss_entries_total` | Counter | LOOKUP 中**不存在或非 READY** 的 entry 数（在 `completion_poller.cc:59-62` 由 `record.results` 统计） | 查询未命中规模 | 突增**通常先于** LOAD miss 出现，是"驱逐过快"的前兆信号 |
 
-> `drampool_dump_nospace_failures_total` 是这组里设计质量最高的一个：它是**直测点**而非推导值，在 `metadata.cc` 的 `StoreBegin` 两次驱逐重试后、最终 `return Error` 前的 `st == Status::NoSpace()` 判定处计数，把"注册失败"排除在外。**读它时需要知道**：默认配置（`default_evict_ratio = 0.0`）下两次重试里的第二次（deep）释放 0 个条目，且每次 on-demand 驱逐只覆盖 1/1024 分片——详见 §3.1-③。
+> `drampool_dump_nospace_failures_total` 是这组里设计质量最高的一个：它是**直测点**而非推导值，在 `metadata.cc` 的 `StoreBegin` 两次驱逐重试后、最终 `return Error` 前的 `st == Status::NoSpace()` 判定处计数，把"注册失败"排除在外。**读它时需要知道**：默认配置（`default_evict_ratio = 0.0`）下两次重试里的第二次（deep）释放 0 个条目，且每次 on-demand 驱逐只覆盖 1/1024 分片——详见 §3.1.2。
 
 ### 2.2 E 组：传输与响应
 
@@ -370,235 +373,235 @@ ucm:drampool_queue_completion_size
 
 ---
 
-## 3. 遇到的问题及优化
+## 3. 开发过程中遇到的典型问题与解决方式
 
-### 3.1 语义类（指标口径错误）
+本节记录 **17 个有代表性的问题**，统一按 **现象 → 根因 → 解决 → 验证** 展开。选取标准是"能代表某一类失效模式"，而不是穷举所有改动。仍未解决、或只做到定位与记录的问题不放在这里，统一见第 4 章。
 
-**① `queue_request_full_total` 的实际口径 ≠ 文档口径**
+一个总体印象值得先写在前面：**这套指标的问题几乎都不在"算错数"，而在"把数放在哪儿、谁负责写、什么时候写、以及读的人怎么理解"。** 17 个案例里只有 2 个是纯粹的数值/口径错误（3.1.1 与 3.1.2），其余全部出在**写入者约束、配置链路、跨进程管道与可视化约定**上。这也解释了为什么大部分修复都是"改一行门控""换一个写入时机""补一处解码"，而不是重写指标。
 
-文档（设计文档 §3.2 H 组 / YAML `documentation`）写的是"每次 TryPush 失败 +1 按次计"，并据此推导"接收阻塞时长 ≈ full 数 × 100µs"。实际代码是：
+### 3.1 口径与采样：指标"测错了"
 
-```cpp
-bool queueFullLogged = false;
-while (!requestReceiverStop_.load(std::memory_order_acquire)) {
-    task->enqueue_us = SteadyNowUs();
-    if (requestQueue_.TryPush(std::move(task))) { ...; break; }
-    if (!queueFullLogged) {
-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID(kQueueRequestFullTotal), 1);
-        UC_WARN(...); queueFullLogged = true;
-    }
-    std::this_thread::sleep_for(idleWait);
-}
-```
-（`drampool_server.cc:457-476`）
+#### 3.1.1 直方图注册时没给桶，热力图整块空白
 
-`queueFullLogged` 使该 counter **每个请求最多 +1**——它计的是"经历过背压的请求数"，不是"满事件数"。因此文档里的阻塞时长推导式**不成立**（阻塞可以任意长，只计一次）。`queue_completion_full_total` 同理是"每个遭遇满队列的记录 +1"（`task_worker.cc:404-406`），它的文档措辞（"full events that forced SubmitCompletion to spin-wait"）倒是准确的。
+- **现象**：DramPool 的批次延迟热力图没有任何数据点，但面板配置与 DramStore 侧完全一致。
+- **根因**：`e5741fab` 版本的 `CreateStats(k*BatchTotalDurationMs, "histogram")` **没有传 bucket 数组**。框架的 `NormalizeBuckets` **只追加 `+Inf`、不存在默认桶集**（`ucm/shared/metrics/cc/domain/metrics.cc:31-38`）——于是该直方图只暴露**一行 `+Inf`**，没有可绘制的分桶。
+- **解决**：`3fc31e21` 为三个 `*_batch_total_duration_ms` 补上显式桶数组；并确认框架的语义是"必须显式给桶"，而不是"不给就用默认"。
+- **验证**：修复后热力图有真实桶数据；后续 `drampool_metrics_test.cc` 对 `kMsBucketsPrepare` 的桶内容做了断言。
+- **教训**：在 C++ 侧注册直方图时，漏传桶**不会退化成粗粒度直方图，而是完全没有分辨率**。这是"静默降级"里最难发现的一种——指标存在、有值、但不可用。
 
-**但自旋等待并非"没有观测"，而是"被吞进别的直方图且无法归因"**（这一条经独立核验修正过，是比"没观测"更值得记的结论）：
-- DUMP/LOAD 的成功路径上，`prepare` 的 `ScopedTimer` 直到 `return SubmitCompletion(...)` 执行完才析构（`task_worker.cc:129` 构造、`:213` 武装、`:226` 返回），所以自旋等待被算进 `dump/load_prepare_duration_ms`——`task_worker.cc:152-154` 的注释明说 prepare 覆盖 "both plus the completion handoff"。
-- 所有 opcode、所有路径上，自旋都在 `*_batch_total_duration_ms` 的区间内（从 `enqueue_us` 到 Poller 终态观测）。
-- 结论：**completionQueue 自旋没有专属指标，它静默地抬高 prepare 与批次总耗时，且无法与传输延迟或 metadata 延迟区分开**——要单独看，得靠 `queue_completion_full_total` 的计数与 `completion_size` 的走向间接推断。
+#### 3.1.2 三个"计数/耗时"口径与文档不符
 
-**② `--kvcache-block-sizes` 与真实 KV 布局无任何关联校验**（会话 `7c33b968`）
+同一类问题的三个实例：指标名和文档描述的是 A，代码实际度量的是 B。没有改代码，而是把口径改正并写进本文，因为代码行为本身是合理的、错的是描述与推导。
 
-`BufferManager::GetPool(size)` 是精确匹配（`pools_.find(size)`），配错就 `no pool registered for size X`，DUMP 直接超时（`-50010`）。
-
-实测踩坑过程：首次用 `--kvcache-block-sizes 4096 8192` → 全部超时；从 vLLM 日志读到 `block_size: 14680064`（28 层 × 524288）→ 加进列表；最后发现**真实 per-entry 长度是 262144**（`tensor_size_list=[262144,262144]`，K/V 两半），而 4 个候选尺寸共享 2GB 池导致 262144 那档槽位被饿死：`buffer_pool_262144: no free slots`，`dump_failed_entries_total = 1554`，`metadata_entry_count = 1638` 恰好等于 `2GB ÷ 5 ÷ 262144`（池正好被填满）。改为以 262144 为主尺寸、池扩到 8GB 后归零。
-
-**③ `PosEvictionPolicy` 在 `evict_ratio == 0` 时直接返回空**
-
-```cpp
-std::vector<EntryPtr> GetEvictionResults(double evict_ratio) override
-{
-    std::vector<EntryPtr> victims;
-    if (evict_ratio == 0.0 || entries_.empty()) { return victims; }
-```
-（`pos_eviction_policy.h:55-58`）
-
-而 `metadataDefaultEvictRatio` 默认为 **0.0**（`drampool_config.h:93`，`examples/drampool.yaml:55` 与 en/zh 文档也都写 0.0；该 key 是必填项，启动后无重载）。
-
-**但"默认配置下驱逐重试是空操作"这个结论要收窄**（此处经独立核验后修正，原表述过宽）：
-
-- `StoreBegin` 的两次驱逐重试里，**第一次**用 periodic 策略，默认是 **TTL**（`drampool_config.h:90`），而 `TtlEvictionPolicy` 走的是生命周期超时、**不读 `evict_ratio`**——所以它不是空操作，是真在干活。
-- **只有第二次（deep，默认 POSITION）**因为 `evict_ratio == 0.0` 而释放 0 个条目。也就是说"两次驱逐重试后仍 NoSpace"的文档措辞与实现（2× `EvictOneShard` + 3× `Allocate`）是**对得上**的；被高估的只是"第二次 deep 重试确实释放了空间"这一层含义。
-- 另有两处让默认配置下的驱逐更弱、且**文档未提**的机制：① on-demand 驱逐每次只用 `rand() % 1024` 挑**一个 shard**（`metadata.cc:188`，`kShardCnt=1024` 见 `metadata.h:197`；`metadata.cc:187` 自带 TODO），只有 GC 线程的 `PerformEvict` 才扫全部分片；② 候选集还要求 `TryMarkEvicting` 通过（READY 且 `refCnt==0` 且 lease 已过期，`entry.h:87-95`），而默认 TTL 是 **120 分钟**（`drampool_config.h:41-42`），所以内存压力下 TTL 路径通常无可驱逐对象。
-- 因此准确的表述是：**`metadata.default_evict_ratio = 0.0`（默认）时，第二次 deep 驱逐重试释放 0 个条目；同时每次 on-demand 驱逐只覆盖 1/1024 的分片。**这是配置默认值问题，不是代码缺陷——`default_evict_ratio` 是可调字段。
-
-### 3.2 并发与单写者类
-
-**④ `queue_completion_size` 有两个写线程**
-
-该 gauge 被两个线程写：TaskWorker（push 之后，`task_worker.cc:409`）与 CompletionPoller（pop 之后，`completion_poller.cc:171`）。而框架的 gauge 合并逻辑是按 `buffers_` 链表顺序**后者覆盖前者**：
-
-```cpp
-for (const auto& [id, value] : read_buf.gaugeStats_) {
-    auto name = MetricName(id);
-    if (name) { totalGauge[*name] = value; }
-}
-```
-（`ucm/shared/metrics/cc/domain/metrics.cc:244-247`）
-
-链表顺序由**线程首次 `UpdateStats` 的时机**决定。因此并发负载下导出的队列深度是"push 后的值"还是"pop 后的值"**不确定，且不是最新的**。这恰好违反了 `drampool_metrics.h:37-42` 自己写下的单写者约束。（对照：`queue_request_size` 的两个写点都在 TaskWorker 线程内，是安全的。）
-
-**⑤ `gc.enabled: false` 时资源 gauge 失效——但两种 gauge 的失效形态不同**
-
-`drampool_metadata_entry_count` 与 per-size 的 `drampool_buffer_pool_usage_ratio_<size>` 的唯一刷新点都是 `GCThreadLoop`（`drampool_server.cc:496-506`）。GC 关掉后：
-
-- **`metadata_entry_count` 被渲染成假 0**：它在静态 defs 表内，`Render` 用 `FindValue` 兜底写 `0.0`（`metrics_reporter.cc:47-51`、`:176`）→ 面板显示"池子是空的"，实际可能是满的。**这不是缺失，是主动误导。**
-- **per-size gauge 是整条序列不出现**（而非画成 0）：`Render` 对 `gaugeValues_` 里不存在的名字直接 `continue`（`metrics_reporter.cc:185-186`）。
-
-有意思的是，队列 capacity gauge 正是为了规避这类问题才被特意搬进常驻的 TaskWorker 循环（`task_worker.cc:49-51` 的注释写明了理由），但同样的推理没有应用到**静态**资源 gauge 上——2026-09-30 的联调里实际观测到了它：writer JSON 报 `metadata_entry_count = 0` 而 `/metrics` 报 264、`buffer_pool_usage_ratio` 报 0 而 `/metrics` 报 0.1014。
-
-**⑥ 批次哨兵机制在实现中的演进**
-
-设计用 `begin_us` 单一字段兼作"批次起点"与"已上报哨兵"（置 0 表示已报）。实现中做了两处调整：
-
-1. **含义与命名**：起点从"TaskWorker 出队时刻"改为"**requestQueue push 时刻**"，字段随之从 `beginUs` 改名为 `enqueueUs`（`3fc31e21`），由 `RequestReceiver` 打戳（`drampool_server.cc:463`）后作为**第三个函数参数**贯穿 `ProcessDump/ProcessLoad/ProcessLookup/QueueResponse`。
-2. **哨兵拆成两个**：`enqueue_us`（置 0 哨兵，管批次总耗时）与新增的 `batch_outcome_reported`（bool，管批次结果计数）。拆开的理由是两个上报点的频次与所在路径不同——批次结果在 `SubmitResponse()` 入口报一次，批次耗时在**终态路径**报一次。
-
-> `enqueue_us == 0` 的语义被正式定义为"本记录不做批次端到端统计"（`completion_poller.cc:78`），这同时成了测试里的安全占位值——单元测试传 `constexpr kEnqueueUs = 0` 即可完全避开批次统计，无需真实时钟读取，也不引入 flakiness。
-
-### 3.3 配置链路类
-
-**⑦ `metrics.enabled = false` 时统计仍在跑**
-
-`drampool_daemon.cc` 原本无条件调用 `SetupDrampoolMetrics()`。由于 `SetUp()` 会把 `isInited_` 置 true 并注册全部 MetricId，而 `UpdateStats` 的**唯一运行时守卫**就是 `isInited_`，结果是：**关闭指标 ≠ 停止统计**。全链路累积的 stats 无人 drain（`MetricsReporter` 是唯一的 `GetAllStatsAndClear()` 调用者）。
-
-用户要求是"不仅不上报，甚至不能开启统计，做到完全隔离"。修复（`900b5e62`，2026-10-14）：
-
-```cpp
-// Same gate as the Python side (setup_ucm_metrics() only calls set_up() when
-// metrics are enabled) ...
-if (g_config.metricsEnabled) { SetupDrampoolMetrics(); }
-```
-
-修复后 disabled ⇒ `isInited_` 保持 false ⇒ 每个 `UpdateStats` 在第一行原子 load 处返回，**线程缓冲根本不会创建**。
-
-配套做了 disabled 路径的安全测试（用户明确要求"不让它setup会不会有访问空指针之类的问题"，`d3205631`）：用独立 harness 对着**真实 metrics core** 编译运行，覆盖 11 项检查。过程中发现 harness 自身一个 bug——`NAME_TO_METRIC_ID` 宏在**每个调用点生成独立的 `CachedMetric` 静态实例**，测试读了另一个实例所以 id 仍是 INVALID。
-
-**残留开销被显式接受**：`ScopedTimer` 构造时的 `SteadyNowUs()`、内联时间算术（作为函数实参求值）、`g_requestQueueLen/g_completionQueueLen` 的 relaxed 原子操作——这些在 disabled 时**仍然执行**。理由：守卫在**被调函数的首行**，C++ 求值顺序决定实参与独立原子语句已经执行过；要给 ~40 个调用点全部加门控是"改动面和回归风险大一个量级"。
-
-**⑧ 配置校验顺序错误导致 CI 失败（`818 - DramPoolConfigTest.RejectsInvalidCommandLines`）**
-
-`NormalizeBlockClasses`（重复 size 合并）原本跑在 `ValidateBlockClassCount`（sizes/proportions 等长校验）**之前**，而合并逻辑按 index 配对 `poolBlockProportions[i]`。当 proportions 比 sizes 短时 → **越界读**；并且合并会把长度"补齐"，**吞掉了本应报出的长度不匹配错误**。修复（`0f75a8d7`，2026-10-13）：把校验提到合并之前，并加注释说明这个顺序约束。
-
-**⑨ 重复 block size 的双重代价**
-
-`--kvcache-block-sizes 512 512` 会同时造成：(a) 重复的 JSON key 与重复的 gauge 注册；(b) 更隐蔽的——`CalculatePoolSlotCounts` 按 index 配对 proportions，`BufferManager` 却只建一个池，**第二个 512 的容量配额被静默丢弃**，等于白配了容量。用户提出"动态注册的 kv buffer 要求唯一"后，修复落在**配置层单点**：`NormalizeBlockClasses()` 合并重复 size 并**把 proportions 相加**（保住总容量）。在三个消费循环里各自去重被认为"治标"。
-
-**⑩ `examples/ucm_config_dramstore.yaml` 照抄看不到任何指标**
-
-官方示例既没有 `enable_metrics` 也没有 `metrics_config_path`，且 `drampool_resource_log_path` 用相对路径 `./logs/drampool_metrics.json`（依赖进程 cwd，而 drampool 与 vLLM 是两个独立进程）。实测必须手工补两个键才拿到完整的 114 个 drampool 系列。**读不到文件时没有任何告警日志。**（截至 2026-10-16 仍未见修复，见 §4.3。）
-
-### 3.4 管道与回流类
-
-**⑪ reporter 永久卡死（`Histogram sum changed without samples`）**
-
-触发条件：drampool 重启而 vLLM 不重启 → `/dev/shm` 里的陈旧 state 与新快照桶数不符。原实现把它当致命错误抛出，而 `_collect_once` 整体失败导致 `_write_state` 永不执行 → **state 永不前进 → 此后每次轮询都撞同一份陈旧 state，无限循环报错**。已实测复现：连续 3 个采集周期全部抛异常、持久化基线时间戳冻结在旧值。
-
-修复走的是用户明确指示的方向——**"要向 Prometheus label 方案看齐，可能之前版本采用聚合方式，导致当前的问题"**：`snapshot_deltas` 从"抛 `ValueError("Histogram schema changed")`"改为**重基线化**（把当前完整分布作为新基线，`_write_state` 在同一周期内持久化新 schema），与 counter 的"下降视为 reset"语义对齐。新增回归测试 `test_histogram_schema_change_rebaselines_instead_of_stalling`。
-
-审计中还发现并修复了一个**遗留的同类陷阱**：`drampool_metrics.json` 的 JSON blob 在仓库里是 CRLF 提交的，而脚本用 `json.dump` 写出 LF → 87 行整文件 diff + git newline warning（文本模式读取会自动 CRLF→LF，所以早期的 round-trip 校验看不见这个问题）。
-
-**⑫ 跨层数值不一致（两个独立事件，均未给出最终解释）**
-
-| 观测 | writer JSON | vLLM `/metrics` = Prometheus | 差异 |
+| 指标 | 文档口径 | 实际口径 | 正确的读法 |
 |---|---|---|---|
-| 2026-09-30（`7c33b968`）`dump_failed_entries_total` | 9576 | 9426 | 150 |
-| 同上 `transfer_failures_total` | 504 | 479 | 25 |
-| 同上 `metadata_entry_count` | 0 | 264 | Gauge 假 0（见 ⑤） |
-| 同上 `buffer_pool_usage_ratio` | 0 | 0.1014 | 同上 |
-| 2026-10-09（`e2e_retrospective_20261012.md`）`dump_requests` | 840 | 728 | **112（12.5%）** |
-| 同上 `submit_failures` | 840 | 728 | 112 |
-| 同上 `dump_failed_entries` | 15960 | 13832 | 2128 = 112×19 |
-| 同上 `response_failures` | 855 | 742 | 113 |
+| `queue_request_full_total` | "每次 TryPush 失败 +1，按次计"；并据此推导"接收阻塞 ≈ full 数 × 100µs" | 由 `queueFullLogged` 门控，**每个请求最多 +1**（`drampool_server.cc:457-476`） | 它计的是**经历过入队背压的请求数**。阻塞时长与它无固定比例，**不能**用 `full_total × 100µs` 估算 |
+| completionQueue 自旋 | 隐含"有专属耗时指标" | **没有专属指标**。自旋发生在 `SubmitCompletion()` 内，被算进 `dump/load_prepare_duration_ms`（成功路径，`task_worker.cc:152-154` 注释明说 "both plus the completion handoff"）以及全部三个 `*_batch_total_duration_ms` | 需要用 `queue_completion_full_total` 的计数 + `queue_completion_size` 的走向**间接**判断；它无法与传输/metadata 延迟区分 |
+| `dump_nospace_failures_total` | "两次驱逐重试后仍 NoSpace" | 措辞与实现（2× `EvictOneShard` + 3× `Allocate`）**对得上**；但默认 `default_evict_ratio = 0.0` 时第二次（deep，POSITION）释放 **0 个条目**（`pos_eviction_policy.h:55-58` + `drampool_config.h:93`），且每次 on-demand 驱逐只覆盖 `rand() % 1024` 的**一个分片** | 增长说明"该分片确实挤不出空间"，**不能**理解为"系统做了充分的驱逐尝试"。要与 `buffer_pool_usage_ratio_*` 和 GC 占空比交叉看 |
 
-两个 counter 的差值（112）在多个指标上**成比例复现**（112 / 112 / 112×19 / 113），说明不是抓取延迟，而是**回流环节系统性丢样本**。当时的判定是"丢失发生在转发环节（reader 采样/增量逻辑）"，并建议为 drampool 增加独立 scrape target 作兜底——**未修复**。
+- **现象**：同一类问题的三个实例——指标名和文档描述的是 A，代码实际度量的是 B。
+- **根因**：不是代码写错，而是**描述与实现漂移**：代码行为本身合理（门控、包含关系、默认参数），但文档、命名与由此推导的公式没有跟上。这类偏差最危险，因为它不影响任何测试。
+- **解决**：更正文档与推导式；不新增指标（新增一个"自旋耗时"会重复计入 `prepare` 与 `batch_total`，违反 S1"不可推导"原则）。
+- **验证**：逐行核对三个埋点 + 一次独立对抗性复核（原表述"自旋完全没有观测"被修正为"被吞进别的直方图且无法归因"）。
+- **教训**：读指标前先确认**分母、粒度、门控**三件事，否则很容易把"请求数"当"事件数"、把"包含"当"独立"。
 
-**⑬ 重启后语义未定论**
+#### 3.1.3 延迟直方图的幸存者偏差
 
-只重启 vLLM 时，`/metrics` 上 `dump/load/lookup_requests_total` 读 0，而 writer JSON 里 `dump_requests_total = 56`。当时假设"重启后 reporter 重新基线化（delta 计数归零）"，验证脚本已写好但被用户中断——**"drampool 的 counter 是跨重启累计还是重启相对"至今没有文档化**，而这直接决定基于 `rate()` 的告警行为。
+- **现象**：系统压力越大，`dump_prepare_duration_ms` 的 P99 反而越好看。
+- **根因**：`prepareTimer.Arm()` 在**数据传输提交成功之后**才被调用（DUMP `task_worker.cc:213`、LOAD `:316`），而 `ScopedTimer` 默认**不武装就不记录**（`drampool_metrics.h:126-150`）。于是函数级提前返回的路径全部不入样本：DUMP/LOAD 各有 3 处（flag slot 超限、无传输短路、提交失败）。更严重的是，**内存压力下的驱逐重试风暴——prepare 最慢的场景——恰好走的是失败返回**。同理，`ReportBatchEndToEnd` 只在终态路径调用，卡在 `Waiting` 的传输永远不会被计入批次耗时。
+- **解决**（部分）：`3fc31e21` 把 prepare 拆成 `*_metadata_duration_ms` 与 `*_submit_duration_ms`，而这两个新直方图**没有 `Arm()` 门控**、是**无条件写入**的——`dump_metadata` 在 `task_worker.cc:185-186` 于空判断之前写出，`*_submit` 在 `:199-200` / `:302-303` 于失败判断之前写出，**连失败的提交都被观测到**。这是"分段细粒度"除了归因之外的第二个收益。
+- **验证/残留**：逐分支枚举确认了准确范围——仍能进入 transfer 的**部分失败批次**（DUMP 的 StoreBegin 失败 `break`、LOAD 的 LoadBegin 失败 `continue`）**会**继续走到提交并 `Arm()`；偏差只存在于函数级提前返回。整批视角的 `prepare` 仍然有偏，见 §4.1-1。
+- **教训**：`Arm()` 这种"只在成功路径武装"的 RAII 写法能避免统计污染，但会系统性丢掉最慢的样本。**凡是"只在成功时记录"的延迟指标，都要问一句：失败是不是正好更慢？**
 
-### 3.5 Grafana / 面板类
+### 3.2 并发与框架正确性：指标"读错了"
 
-**⑭ Prometheus 保留名字里的冒号**
+#### 3.2.1 metrics 双缓冲的 acquire/release 竞争——x86 上直接段错误
 
-vLLM 暴露 `ucm:drampool_dump_requests_total`，**Prometheus 不会把 `:` 规范化成 `_`**（与上一轮交接文档的说法相反）。PromQL 必须写：
-```promql
-{__name__="ucm:drampool_dump_requests_total"}
-```
-写 `ucm_drampool_...` 会返回空，**看起来像链路断了，实际只是选择器错了**。这个错误说法直接把排查引向了歧途，后来从总结文档中删除。
+这是整个工作中**最严重的一次**指标模块自身故障：它不是"数值不准"，而是直接让进程段错误，因此也是"整套指标可不可信"的地基。
 
-**⑮ Grafana 11 拒绝重复 refId**
+- **现象**：H100 节点上的 worker 在处理请求时，于 metrics 模块内部发生段错误，调用栈落在：
+  ```
+  std::__detail::_Map_base<unsigned int, std::pair<unsigned int const, UC::Metrics::HistogramStat>, ...>::operator[]
+  UC::Metrics::Metrics::UpdateBuffer(...)
+  UC::Metrics::Metrics::UpdateStats(unsigned int, double)
+  UC::CacheStore::DumpQueue::DispatchOneTask(...)
+  ```
+  触发点在 CacheStore，但用的就是同一套 `UC::Metrics` 双缓冲——**DramPool 的每一条指标都走这条路径，因此同样受影响**（只是没有在 DramPool 自己的压测里复现过）。
+- **根因**：双缓冲的握手（写线程写一个 buffer，收集线程切到另一个、等旧 buffer 写完后读取并清空）靠原子变量确认对方状态，但用的是 **acquire/release**。在多线程下这不保证双方一定看到对方的修改：x86 会把写线程的 store 延后生效，于是**写线程还在写某个 buffer 时，收集线程已经开始读取并清空它**，`unordered_map` 被同时修改和清空 → 堆损坏、崩溃。
+- **为什么只在 x86**：aarch64（Kunpeng 920）上编译器生成的 `stlr`/`ldar` 本身保证了顺序，硬件上不会出现这种重排。**这就是为什么 A2/A3 上的 Ascend 联调从来没撞到它**——不是代码没问题，而是平台替它挡住了。
+- **解决**：`7164b731` 把握手中的四处原子操作改为 `seq_cst`——`SwitchBuffer` 改为 `fetch_xor(1, seq_cst)`；`BeginWrite` 中写 `activeWriteIdx_` 与随后读 `writeIdx_`；`WaitNoActiveWriter` 的读。四者共享同一全局顺序，写线程与收集线程不会再"同时看不到对方"。实现与仓库里已有的 `kv_semantics/metrics/src/standalone_metrics_backend.cc` 对齐。
+- **验证**（这是本节证据最完整的一例）：
+  - 新增压测 `UCMetricsStress.DISABLED_TenWritersOneCollector`：10 个写线程持续更新同一 histogram，1 个收集线程循环 drain，持续 3 秒；每次快照断言 `sum == count`，结束时断言无更新丢失。
+  - x86_64：修复前 **10/10 失败**（8 次段错误 + 2 次快照异常，均在 20 ms 内触发）；修复后 **10/10 通过**。
+  - aarch64：修复前后均 10/10 通过；对照实验把那次 store 改为 `relaxed` 后，**0.03–0.21 秒内失败**（3 次中 1 次段错误），证明测试确实能捕获该重排。
+  - 性能代价：x86 每次 `UpdateStats` 约 **+2 ns**（`seq_cst` store 使用 `xchg`）；aarch64 **无可测变化**（生成同一组 `stlr`/`ldar`）。`GetAllStatsAndClear` 单次约 10 µs，无变化。
+  - 该用例默认**禁用**（竞争可能破坏堆），需 `--gtest_also_run_disabled_tests` 在独立进程中运行。
+- **教训**：内存序问题会**按平台选择性呈现**，"在目标硬件上跑不出问题"不能作为内存序正确的证据。对本文的影响也需要说清：Ascend 上修复前后行为一致（硬件保序），所以本报告的联调数值不受这次修复影响；但**如果这套指标跑在 x86 上，修复前的数值随时可能因堆损坏而丢弃甚至让进程崩溃**。
 
-联调脚本生成的 12 面板全部把每个 target 的 refId 写成 `"A"` → `HTTP 400 {"messageId":"query.duplicateRefId"}` → 除单 target 面板外全部报 "No data"（而 target 从未 down、样本连续）。修复：重排 refId（A/B/C/D）并让生成器自动分配。
+#### 3.2.2 批次哨兵：单字段复用 → 两个独立机制
 
-**⑯ 面板指标名笔误**
+- **现象**：批次结果（`dump_failed_entries_total`）与批次端到端耗时都必须在 `SubmitResponse()` 上报，而该函数会因 flag 池 NoSpace **同阶段重入**，重复上报会污染计数与直方图。
+- **根因**：原设计用一个 `begin_us` 字段兼作"批次起点"与"已上报哨兵"（上报后置 0）。但两个上报点的**频次与所在路径不同**——批次结果在 `SubmitResponse()` 入口报一次；批次耗时在**终态路径**报一次（成功/失败/永久失败共 5 处）。一个字段表达两件事，无法表示"已报结果但未报耗时"的中间态。
+- **解决**：拆成两套机制——`enqueue_us`（置 0 哨兵，只管批次总耗时）与 `batch_outcome_reported`（bool，只管批次结果）。同时把起点从"TaskWorker 出队"改为"**requestQueue push**"，字段由 `beginUs` 改名 `enqueueUs`（`3fc31e21`），由 `RequestReceiver` 打戳后作为第三个参数贯穿 `ProcessDump/ProcessLoad/ProcessLookup/QueueResponse`（`drampool_server.cc:463`）。
+- **验证**：`enqueue_us == 0` 被正式定义为"本记录不做批次端到端统计"（`completion_poller.cc:78`），于是测试可以直接传 `constexpr kEnqueueUs = 0` 完全绕开批次统计——无需真实时钟、不引入 flakiness。
+- **教训**：哨兵值只有"一种语义"时才安全。当两个上报点节奏不同，宁可多一个 bool，也不要复用同一个字段。
 
-panel 引用 `ucm:ucm_hit_blocks_total`，仓库与 Prometheus 中均**不存在**；真实名是 `ucm:ucm_hit_tokens_total`（tokens 非 blocks）→ 该序列恒空。
+### 3.3 配置与开关：指标"没上线 / 配错了"
 
-**⑰ 官方 `grafana_store.json` 不含任何 drampool 面板**
+#### 3.3.1 `metrics.enabled = false` 时统计仍在跑
 
-只覆盖 `ucm:cache_*` 与 `ucm:mooncake_*`。PR 1394 加了指标与 `metrics_configs.yaml` 定义，却**没有配套面板**，指标出不了图。这直接催生了仓库自带的 `examples/metrics/grafana_dram.json`（uid `ucm-dram-metrics`，共 16 个 panel，其中 **8 个**用到 drampool 序列：`KV Buffer Slot Usage`、`DramPool request throughput`、`DramPool end-to-end latency distribution`、`DramPool local stage latency - p95`、`Queue utilization`、`Memory pool utilization`、`KV Buffer Slot Usage by Block Size`、`DramPool error rate`；另 8 个是 DramStore 专属） |
+- **现象**：用户要求关闭指标后"不仅不上报，甚至不能开启统计"，但实测关闭开关后热路径仍在累积。
+- **根因**：`drampool_daemon.cc` 原本**无条件**调用 `SetupDrampoolMetrics()`。而 `SetUp()` 会把 `isInited_` 置 true 并注册全部 MetricId，`UpdateStats` 的**唯一运行时守卫**正是 `isInited_`——于是关闭开关只切断了"drain + 写文件"，统计本身照跑，且这些 stats **无人消费**（`MetricsReporter` 是唯一的 `GetAllStatsAndClear()` 调用者）。
+- **解决**（`900b5e62`，2026-10-14）：把注册入口本身纳入开关，与 UCM Python 侧 `setup_ucm_metrics()` 跳过 `set_up()` 的形状对齐：
+  ```cpp
+  if (g_config.metricsEnabled) { SetupDrampoolMetrics(); }
+  ```
+  关闭后 `isInited_` 保持 false，每个 `UpdateStats` 在第一行原子 load 处返回，**线程缓冲根本不会创建**。
+- **验证**：按用户要求做了 disabled 路径的安全测试（"不让它 setup 会不会有访问空指针"）——用独立 harness 对着**真实 metrics core** 编译运行，覆盖 11 项检查（含 8 线程 × 20000 次压测与 enabled 对照组）。过程中发现 harness 自身一个 bug：`NAME_TO_METRIC_ID` 在**每个调用点生成独立的 `CachedMetric` 静态实例**，测试读了另一个实例，所以 id 永远是 INVALID。
+- **残留（显式接受）**：`ScopedTimer` 构造时的 `SteadyNowUs()`、作为实参求值的内联时间算术、`g_requestQueueLen/g_completionQueueLen` 的 relaxed 原子——在 disabled 时仍执行。理由是守卫在**被调函数首行**，C++ 求值顺序决定实参已算完；给 ~40 个调用点全部加门控"改动面和回归风险大一个量级"。
+- **教训**：**开关要落在"系统边界"上，而不是"输出去向"上。** 只关输出会留下完整的无效计算，且因为没有消费者，这类浪费极难从外部发现。
 
-**⑱ 幻影序列与化石序列**
+#### 3.3.2 配置校验顺序错误：越界读 + 吞掉报错 → CI 失败
 
-- 图例里出现一行无名的 `Value`、恒 0%：这是 **slot_size label 为空**的序列——suffix 拆分约定引入**之前**的旧进程/导出端直接写基名 `drampool_buffer_pool_usage_ratio`。`split_dynamic_metric_name` 把它映射成空 label。当前 C++ 代码只写带后缀的名字（`drampool_server.cc:499`），所以这是环境里的化石。建议在查询里加 `slot_size != ""`（**未被采用**）。
-- 从配置里删掉某个 size 后，导出进程里已创建的 label child **不会被回收**，旧行会停在最后一个值上，直到 exporter 进程重启（`observability.py:199-200` 只 `labels().set()`，从不删除）。
+- **现象**：`818 - DramPoolConfigTest.RejectsInvalidCommandLines` 在一条**没有触碰被测代码**的分支上失败。
+- **根因**：`NormalizeBlockClasses`（重复 size 合并）原本跑在 `ValidateBlockClassCount`（sizes/proportions 等长校验）**之前**，而合并逻辑按 index 配对 `poolBlockProportions[i]`。当 proportions 比 sizes 短时 → **越界读**；更隐蔽的是，合并会把长度"补齐"，**吞掉了本应报出的长度不匹配错误**，于是测试期望的拒绝没有发生。
+- **解决**（`0f75a8d7`，2026-10-13）：把 `ValidateBlockClassCount` 提到 `NormalizeBlockClasses` 之前，并加注释写明这个顺序约束（合并会读取每个 size 对应的 proportion 并对齐长度，先合并就会掩盖不匹配）。
+- **验证**：本地用 `fmt` shim 写了一个最小复现 harness，直接跑全部 13 个负例与 2 个正例：修复前在第 12 个子用例上 abort，修复后全部通过。
+- **教训**：**校验与规整的顺序是有语义的**。"先归一化再校验"会静默吞掉本应报错的输入。
 
-**⑲ 面板默认时间窗掩盖活动**
+#### 3.3.3 重复 block size：重复注册 + 容量静默丢弃
 
-面板默认"最近 30 分钟"，而最后一次请求在 8 小时前 → 曲线停在 168 的平线，**读起来和"没数据"一样**。另外累计 counter 面板在空闲期本来就是阶梯状平线。这两点当时只用口头指导解决（切到 Last 12 hours、看 rate 面板），**未改面板默认值**。
+- **现象**：`--kvcache-block-sizes 512 512` 会在 JSON 里出现重复 key、重复 gauge 注册。
+- **根因**：`g_config.poolBlockSizes` 保留重复项，而 `BufferManager` 每个不同 size 只建一个池、`CalculatePoolSlotCounts` 又**按 index 配对** proportions——于是第二个 512 的容量配额**被静默丢弃**，等于白配了容量。前两个症状看得见，第三个看不见。
+- **解决**：在**配置层单点**修（`NormalizeBlockClasses()`）：合并重复 size 并**把 proportions 相加**（保住总容量）。在注册/GC/Render 三个消费循环里各自去重被判为"治标"。
+- **验证**：新增启动测试覆盖合并与比例求和；`drampool_metrics_test` 与 `drampool_startup_test` 通过（CI）。
+- **教训**：同一个坏输入如果要在 N 个消费方各自防御，说明**防御点选错了**。放在唯一收敛点，三处自动一致。
 
-### 3.6 工程与流程类
+#### 3.3.4 block size 与真实 KV 布局不匹配：`-50010`，而面板上看不出原因
 
-**⑳ 联调中的自我纠错（值得记录的三个）**
+- **现象**：请求发出后全部超时（客户端 `-50010`），drampool 侧没有任何请求处理日志；指标面上 `dump_requests_total` 为 0。
+- **根因**：`BufferManager::GetPool(size)` 是**精确匹配**（`pools_.find(size)`），配错就返回 `no pool registered for size X`，DUMP 直接失败。而真实 per-entry 长度不是从模型配置能直接算出来的那个值。
+- **排查过程（三个错误假设）**：先按 `--kvcache-block-sizes 4096 8192` 启 → 全部超时；从 vLLM 日志读到 `block_size: 14680064`（28 层 × 524288）→ 加进列表；最后发现**真实 per-entry 长度是 262144**（`tensor_size_list=[262144,262144]`，K/V 两半）。
+- **定位手段**：`metadata_entry_count = 1638` 恰好等于 `2GB ÷ 5 ÷ 262144`——**池正好被填满**，这个"过于整齐"的数字是决定性线索；日志 `buffer_pool_262144: no free slots` 与 `dump_failed_entries_total = 1554` 交叉确认。
+- **解决**：以 262144 为主尺寸、池扩到 8GB。
+- **验证**：`no-free-slots` 计数归 0；外部命中打通（`hit external: 21`、`ucm_hit_tokens_total = 2688`）。
+- **教训**：**指标在这里的价值是"排除法"**——`dump_requests_total = 0` 说明请求根本没进处理路径，把排查方向从"传输慢"直接推到"配置/准入"。同时它也暴露了缺口：分配失败没有 entry 级信号（§4.2-13）。
 
-1. **"我一直在跑错的二进制"**：harness A/B 实验（CANN 9.1 vs 8.5.1、6 种设备配对、真实 IP vs loopback）全部跑在一个 **Jul-28 构建**的二进制上，而源码是 Sep-23 的，且该二进制**没有 `CLIENT_INIT` 标记**（成功那次的源码有）。→ **全部结论作废**。重建后才发现：握手与内存注册完全成功，**只有数据搬运失败**。
-2. **归因撤回**："0/2/3 做不了传输"的依据中，"真实栈传输失败"是硬的（产品代码路径），"harness 在 6 种配对都失败"是软的——后者已被证伪。
-3. **循环论证撤回**：Grafana `orientation: horizontal` 的争议中，助手把自己的语义假设编码进公式再把"匹配"当作独立验证，随后公开撤回。
+### 3.4 跨进程回流：指标"传丢了 / 卡住了"
 
-**㉑ 计量陷阱：日志限流使"数日志行数"严重低估失败规模**
+#### 3.4.1 reporter 永久卡死：两个入口，同一个根因
 
-`UC_ERROR` 走限流路径（默认 60s 窗口、每调用点最多 3 条，计数位宽仅 2 bit 且**上限硬编码为 3，环境变量无法调高**）。实证：JSON 里 `submit_failures_total = 840`，而日志只有 15 条（5 批 × 3，恰为限流上限），失败 request_id 呈连续三元组（1,2,3 / 169,170,171 / …）即限流指纹。**差距约两个数量级。**
+- **现象**：`/metrics` 上的 drampool 指标不再更新，vLLM 日志每个采集周期都报同一句 `Histogram sum changed without samples` / `Histogram schema changed`。
+- **两个触发入口**：
+  - **A. 陈旧 state**：drampool 重启（计数器归零）而 vLLM 不重启时，`/dev/shm` 里的持久化基线仍是旧值。
+  - **B. 桶布局变更**：升级后桶集从 15/11 值统一为 14 值，旧基线与新快照的 `upper_bounds` 不再匹配。
+- **根因（两者相同）**：`snapshot_deltas` 把"schema 不匹配"当**致命错误**抛出，而 `_collect_once` 整体失败导致 `_write_state` **永不执行** → 持久化基线**永不前进** → 此后每次轮询都撞同一份陈旧 state，**无限循环报错**。实测复现：连续 3 个采集周期全部抛异常，基线时间戳冻结。
+- **解决**（用户明确指示"要向 Prometheus label 方案看齐，可能之前版本采用聚合方式，导致当前的问题"）：把 `upper_bounds` 不匹配从"抛错"改为**重基线化**——把当前完整分布作为新基线，`_write_state` 在**同一周期**内持久化新 schema，与 counter 的"下降视为 reset"语义对齐。
+- **验证**：新增回归测试 `test_histogram_schema_change_rebaselines_instead_of_stalling`；端到端确认第一个采集周期即恢复（以 14 值 schema 重基线）；全套 24 个 reporter 测试通过。
+- **附带发现（同类"状态被写坏"）**：`drampool_metrics.json` 在仓库里以 **CRLF** 提交，而脚本用 `json.dump` 写出 LF → 87 行整文件 diff + git newline warning。且文本模式读取会自动 CRLF→LF，导致早期的 round-trip 校验**看不见**这个问题，必须做字节级比对。
+- **教训**：**"读后即清 + 持久化基线"的管道里，任何一次整体失败都会冻结基线。** 要么按指标粒度提交状态，要么让失败只影响当轮增量，不能让"状态不前进"成为失败的副作用。
 
-**㉒ 若干"空壳配置"**
+### 3.5 可视化：指标"画不出来 / 画错了"
 
-`--nics` 只被 `ValidateNics()` 检查非空，**从未传给 HIXL**；`enable_cs`（YAML）同样从未进入 `HixlInitAttrs`。两者在排障时都消耗了无效功。2026-10-16 复核：`grep -rn 'nics' ucm/store/dram/cc/drampool/` 在非测试代码中**零命中**，确认已解析入 config 但无任何消费点。
+#### 3.5.1 三个"看起来像链路断了"的假故障
 
-**㉓ 指标改动打破了测试契约，导致 PR 门禁两处失败**（会话 `8ef10cad`，PR #3820）
+联调时最耗时的一类问题：数据其实一直在，只是查询或面板写错了。三者都表现为"没有数据"。
 
-用户报告"pr门禁有两处fail check"。归因到 `3fc31e21 "Refine DramPool metrics"`：
+| 现象 | 根因 | 解决 |
+|---|---|---|
+| PromQL 查 `ucm_drampool_dump_requests_total` 返回空，像没采集到 | 导出名保留冒号（`ucm:drampool_...`），Prometheus **不做** `:` → `_` 的规范化；裸标识符不是它的合法选择器 | 全部查询与面板改用 `{__name__="ucm:drampool_..."}`；并把上一轮交接文档里"Prometheus 会把冒号规范化"的错误说法从总结中删除 |
+| 某条序列恒空（`external_ucm_hit`） | 面板引用 `ucm:ucm_hit_blocks_total`，该名字**不存在**；真实名是 `ucm:ucm_hit_tokens_total`（tokens 非 blocks） | 同步修正面板 JSON 与生成器 |
+| 12 个面板除单 target 外全部 "No data"，但 target 从未 down、样本连续 | 生成器把每个 panel 的所有 target 的 `refId` 都写成 `"A"`；Grafana 11 直接拒绝：`HTTP 400 {"messageId":"query.duplicateRefId"}` | 重排 refId（A/B/C/D）并让生成器自动分配；provisioning 自动重载后 12 面板全部出数 |
 
-- **cpp_gtest**：该提交为 `ProcessDump/ProcessLoad/ProcessLookup` 增加了第三个参数 `enqueueUs`（含 `beginUs → enqueueUs` 改名），但测试夹具的包装函数没跟着改 → `task_worker_test.cc:127/133/139` 报 `candidate expects 3 arguments, 2 provided`。修复：加 `constexpr std::uint64_t kEnqueueUs = 0;` 并在三处传入（0 即哨兵值，测试无延迟断言，因此不引入 flakiness）。
-- **cpp-linter**：18 个改动文件里 6 个存在换行/对齐/头文件顺序违规（Google 风格，`ColumnLimit 100`）。修复为 `clang-format 20.1.8` 纯格式化。
+- **验证**：修正后 Prometheus 返回 114 个 drampool 系列；`external_ucm_hit` 序列首次有值；12 个面板全部出实时数据。三者的共同特征是**改完之后数据立刻出现，无需动任何采集/传输代码**——这本身就是"管道一直是通的"的反证。
+- **教训**：**"没数据"先分三层排查**——选择器对不对（名字/标签）→ 面板配置对不对（refId/数据源）→ 才是管道通不通。顺序反了会白查一整轮。
 
-> 一处顺带发现但**未解决**：`task_worker_test.cc` 未被 `ucm/store/test` 下任何 `CMakeLists` 引用，**不确定哪个 CI config 在编译它**——也就是说那个 cpp_gtest 修复未必真被门禁执行到。
+#### 3.5.2 未使用 size 的恒 0 行 → sticky reveal
 
-**㉔ 历史上"直方图没有桶"这个 bug 曾让热力图全空**
+- **现象**：面板上 4 行里 3 行恒为 0%，用户直接质疑"为什么没有这个 size 的占用，却动态注册并一直画 0"。
+- **根因（三层叠加）**：① 启动时按配置为**每个** size 建池并注册 gauge；② GC 循环**无条件**上报所有 size；③ 空池的 ratio 是真实测量值 `0 / N = 0.0`，于是导出端首见即建 label child，面板画出贴地直线。
+- **解决**（用户提出"首次请求时注册、此后一直存在"的方案后，`7e515b8c`）：改为**粘性揭示（sticky reveal）**——`BufferManager` 用 `unordered_map<size, atomic_bool> revealed_` 记录"该 size 已被成功分配过"，在唯一的分配入口 `Allocate` 处置位；GC 循环只上报 `IsRevealed` 的 size；`Render` 跳过 `gaugeValues_` 中不存在的名字（否则导出端首见即建 child，0 行又回来）。
+- **验证**：新增 5 用例的 `drampool_buffer_manager_reveal_test.cc`（本地未编译，CI 验证）；三份文档同步更新语义；面板上只出现真正用过的 size。
+- **权衡（明确记录）**：识别"配置了但从未使用"的预留池从占用率面板上消失。价值仍在——它依然占用 DRAM，应改在**容量类面板**呈现，而不是画成 0% 噪声。
+- **教训**：**"注册了"和"有数据"是两回事。** 在 Prometheus 里，一条恒 0 的序列既可能是真实测量，也可能是"从未被测到"，面板无法区分。
 
-`e5741fab` 版本里 `CreateStats(k*BatchTotalDurationMs, "histogram")` **没有传 bucket 数组**，而框架的 `NormalizeBuckets` **只追加 `+Inf`、没有默认桶集**（`metrics.cc:31-38`）——结果是该直方图只暴露一行 `+Inf`，热力图无从绘制。`3fc31e21` 补上了显式桶数组。这条机制值得记住：**在 C++ 侧注册直方图必须显式给桶**，否则不会退化成一个粗粒度的直方图，而是**完全没有分辨率**。
+#### 3.5.3 两张热力图 Y 轴不统一 → 桶集统一
 
-### 3.7 优化清单
+- **现象**：用户报告"两者的纵坐标轴不统一"——同为"端到端延迟"的热力图，DramStore 侧 Y 轴到 10s、DramPool 侧只到 1s。
+- **根因**：不是面板配置。两张面板的 `yAxis` 与 `le` 过滤正则**完全相同**（`grafana_dram.json:379-387/398` 与 `475-483/494`），差异来自**桶集本身**：`operation=lookup` 时 drampool 的 `lookup_batch_total` 用 11 值桶（上限 1000ms），2000/5000/10000 的 `le` 序列根本不存在。
+- **解决**：按用户给定的刻度 `0.1,0.5,1,2,5,10,20,50,100,200,500,1000,2000,5000` 统一所有 ms 直方图（3 个文件、20 处取值改动）；面板与 `le` 正则**不动**（10000 分支自然失效，无害）。
+- **验证**：C++ 桶常量与 YAML/default 两处镜像逐值一致；两张热力图收敛到同一组有限桶行。
+- **已接受的代价**：transfer/rtt 类原先 5000–10000 有独立桶，现在 **>5000 ms 全部落入 `+Inf`**——这是与 §4.1-4 同一问题的另一面。
+- **教训**：**跨面板可比性依赖"桶布局"这个隐性契约**，而它藏在三处镜像里、没有任何一致性测试（§4.3-28）。
 
-| # | 优化项 | 优化前 | 优化后 | 收益 |
+#### 3.5.4 官方 dashboard 不含任何 drampool 面板
+
+- **现象**：按示例导入 `grafana_store.json` 后看不到任何 drampool 指标。
+- **根因**：该面板只覆盖 `ucm:cache_*` 与 `ucm:mooncake_*`。PR 1394 加了指标与 `metrics_configs.yaml` 定义，却**没有配套面板**——指标存在但出不了图。
+- **解决**：仓库新增 `examples/metrics/grafana_dram.json`（uid `ucm-dram-metrics`，共 16 个 panel，其中 **8 个**使用 drampool 序列）；联调期间另生成过一份 12 面板的临时板。
+- **验证**：导入后 8 个 drampool 面板全部出实时数据（热力图、p95、错误率、水位）。
+- **教训**：**"指标交付"的完成定义应包含可视化**，否则等于没有。
+
+### 3.6 联调与工程流程：方法层面的坑
+
+#### 3.6.1 跑错二进制 → 全部 A/B 结论作废
+
+- **现象**：一整轮 harness A/B 实验（CANN 9.1 vs 8.5.1、6 种设备配对、真实 IP vs loopback）都指向"设备/版本不行"，但结论互相矛盾。
+- **根因**：所有实验跑的二进制是 **Jul-28 构建**，而对应源码是 Sep-23 的；且该二进制**不含 `CLIENT_INIT` 标记**（历史上成功那次的源码有）。一个更早的线索是同一份日志的行号与源码对不上。
+- **解决**：按 `compile_commands.json` 与 `drampool` 的 `link.txt` 提取真实编译/链接参数（含 `shlex` 解析与 `g++ @response-file` 以保留带引号的宏），从源码重建 harness；用 `strings` 校验 `CLIENT_INIT` 出现 11 次。
+- **验证/结果**：干净复跑后才发现**握手与内存注册完全成功，只有数据搬运失败**——这一结论把排查方向从"配置/设备"彻底转向"链路/介质"，并最终定位到 8 张 NPU 的 RoCE 链路全部 DOWN。
+- **教训**：**"我测的是我以为的那个构建吗"必须成为实验前的第一个检查项。** 该类问题与另一处 `cp` 覆盖运行中二进制失败（`Text file busy`，回退静默未生效）是同一类：测的是一个不是自己构建的产物。
+
+#### 3.6.2 日志限流：数日志行数会低估失败规模两个数量级
+
+- **现象**：`submit_failures_total = 840`，但 drampool 日志里只有 15 条 `Dump SubmitAsync failed`。
+- **根因**：`UC_ERROR` 走限流路径——默认 60s 窗口、每调用点最多 3 条，且计数位宽仅 2 bit、**上限硬编码为 3，环境变量无法调高**。15 = 5 批 × 3，恰是上限；失败 `request_id` 呈连续三元组（1,2,3 / 169,170,171 / …）就是限流指纹。
+- **解决**：把"排障时禁止用日志行数估计失败规模"写入联调文档；记录可用开关 `UCM_LOG_RATE_LIMIT_ENABLE` / `UCM_LOG_RATE_LIMIT_WINDOW_MS` / `UCM_LOG_RATE_LIMIT_MAX_LOGS`（后者实际被钳到 ≤3）。
+- **验证**：以 JSON 里的 counter 为权威值，与日志行数对比确认差距约两个数量级。
+- **教训**：**计数类结论一律以指标为准，日志只用于定性**。这条本身也是"为什么要做这套 metrics"的一次自证。
+
+#### 3.6.3 指标参数变更打破测试契约 → PR 门禁两处失败
+
+- **现象**：PR 门禁两处 fail check，报错与指标改动看不出直接关系。
+- **根因**：`3fc31e21 "Refine DramPool metrics"` 给 `ProcessDump/ProcessLoad/ProcessLookup` 增加了第三个参数 `enqueueUs`（并做了 `beginUs → enqueueUs` 改名），但测试夹具的包装函数没跟着改。
+  - **cpp_gtest**：`task_worker_test.cc:127/133/139` 报 `candidate expects 3 arguments, 2 provided`。
+  - **cpp-linter**：18 个改动文件里 6 个有换行/对齐/头文件顺序违规（Google 风格，`ColumnLimit 100`）。
+- **解决**：测试里加 `constexpr std::uint64_t kEnqueueUs = 0;` 并在三处传入（0 即哨兵值，测试无延迟断言，不引入 flakiness）；`clang-format 20.1.8` 纯格式化 6 个文件、14 个 hunk。
+- **验证**：本地按 linter 的文件集复跑 `clang-format --dry-run --Werror`，全部通过；格式化幂等。
+- **残留**：`task_worker_test.cc` **未被 `ucm/store/test` 下任何 `CMakeLists` 引用**，不确定哪个 CI config 在编译它——也就是说这个修复未必真被门禁执行到（§4.3-27）。
+- **教训**：**改函数签名时，测试是"调用方"而不是"附属物"**；同时"门禁绿了"不等于"这个测试真的跑了"。
+
+### 3.7 一览：问题、手段、落点与验证
+
+| # | 问题 | 解决手段 | 落点 / 提交 | 验证方式 |
 |---|---|---|---|---|
-| 1 | **slot-used 计数移出共享 BufferPool**（`0fde501b`） | 为加水位指标改了**共享组件** `ucm/shared/pool/buffer_pool.{h,cc}`（违反设计的"不修改共享组件"约束），所有 BufferPool 使用者都为此付费 | `BufferManager::usedBySize_` 原子计数，共享 BufferPool 零改动、零开销 | 恢复架构约束边界。附带一条被文档化的正确性约定："Callers must Free with the same size used at Allocate, or the counter for the mismatched size drifts." |
-| 2 | **指标关闭时完全隔离统计**（`900b5e62`） | `SetUp()` 照跑 → 每个 `UpdateStats` 都真实累积、每线程分配 buffer、无人 drain | `isInited_` 保持 false → 全部 `UpdateStats` 在首行原子 load 处返回，线程缓冲不创建 | 关闭指标真的省 CPU/内存，且与 Python 侧 `setup_ucm_metrics` 的门控语义一致 |
-| 3 | **惰性揭示（sticky reveal）替代全量预注册**（`7e515b8c`） | 每个配置 size 从进程启动就上报，未使用的池画成恒 0% 直线（实测 4 行里 3 行是噪声） | 首次成功分配才 reveal，此后永久保留；GC 循环按 `IsRevealed` 过滤，`Render` 跳过 `gaugeValues_` 中不存在的名字 | 序列数 = 实际用到的 size 数，图例稳定、不闪烁 |
-| 4 | **桶集统一到 14 值**（`7ce12bca`） | transfer 15 值（含 10000）、lookup_batch 11 值（上限 1000ms）、DramStore 侧 15 值——每个直方图暴露各自的 `le` 序列集 | 统一为 `0.1…5000` 14 值 | 起因是用户报告的**面板现象**："两者的纵坐标轴不统一"——同一个"端到端延迟"热力图，DramStore 侧 Y 轴到 10s、DramPool 侧只到 1s，因为 `operation=lookup` 时 drampool 的 `lookup_batch_total` 用 11 值桶（上限 1000），2000/5000/10000 的 `le` 序列不存在。修复后两张热力图共享同一组有限桶行，跨面板 Y 轴可比。**已接受的代价**：transfer/rtt 类指标原先 5000–10000 有独立桶，现在 **>5000ms 全部落入 `+Inf`**（见 §4.1-4） |
-| 5 | **为按值维度引入后缀编码 + 导出侧解码**（`112dd1bb` 等） | 要么报告期聚合成单一值（永久丢信息），要么改 ~12–14 文件的传输模型 | 线格式不变；`dynamic_labels` 单点声明驱动 4 道 name-keyed 关卡；共享 `split_dynamic_metric_name()` | 只改一个指标族的风险面；向后兼容由构造保证（空 `_dynamic_bases` ⇒ 原静态路径） |
-| 6 | **重复 block size 在配置层归并**（`0f75a8d7` + 前置实现） | 重复 JSON key、重复 gauge 注册、静默丢弃重复类的容量配额 | `NormalizeBlockClasses()` 合并 size 并**相加 proportions**；校验顺序修正 | 一次修复同时消灭 gauge 唯一性问题与容量静默丢失 |
-| 7 | **热路径指标 id 预解析** | 每次 `UpdateStats` 做字符串查表 | `NAME_TO_METRIC_ID()` 生成 per-call-site 静态 `CachedMetric`，id 只解析一次（与 DramStore 同模式） | 热路径零字符串查找 |
-| 8 | **观测点选在低频线程** | 数据池水位若每请求上报会侵入 SPSC 管道 | 水位 gauge 挂 GC 线程（`gcIntervalMs` 默认 1s 一轮）；flag 池水位由 CompletionPoller 单线程记账（普通 `size_t`，无需 atomic） | 请求热路径零指标开销 |
-| 9 | **Grafana JSON 结构化编辑纪律** | 文本编辑/`json.dump` 产生整文件 diff 与换行告警 | 编辑前后做**字节级** round-trip 校验 + 保留 CRLF；变量级联顺序显式约束 | dashboard diff 可评审（最终 50/37 行，全是语义变更） |
-| 10 | **联调脚本加入 RoCE 链路预检** | 数据面故障只表现为难以解读的 `507001` / `503900`，且要等模型加载数分钟后才暴露 | `hccn_tool -i N -link -g` 全卡预检，全 DOWN 时直接报错并给出诊断命令与通过判据 | 本次联调最大的教训被固化成 fail-fast 预检 |
+| 1 | 直方图没给桶，热力图空白 | 显式传桶数组 | `3fc31e21` | 热力图出数；桶内容断言 |
+| 2 | 计数/耗时口径与文档不符 | 更正口径与推导，不新增指标 | 本文 §2 / §3.1.2 | 逐行核对 + 独立复核 |
+| 3 | 延迟直方图幸存者偏差 | prepare 拆 metadata/submit（无门控）部分补偿 | `3fc31e21` | 逐分支枚举 |
+| 4 | metrics 双缓冲竞争（x86 段错误） | 四处原子操作改 `seq_cst` | `7164b731` | 10 写 × 1 收 × 3s 压测：x86 10/10 → 10/10 |
+| 5 | 批次哨兵单字段复用 | `enqueue_us` + `batch_outcome_reported` 两套机制 | `3fc31e21` | 哨兵语义单测 + `kEnqueueUs=0` |
+| 6 | 开关关闭仍统计 | 门控 `SetupDrampoolMetrics()` | `900b5e62` | 独立 harness 11 项检查 |
+| 7 | 校验顺序导致越界读 + 吞错 | 校验提到合并之前 | `0f75a8d7` | 13 负例 + 2 正例本地复现 |
+| 8 | 重复 block size 丢容量 | 配置层归并 + proportions 相加 | `b8a4415d` 前置 + `NormalizeBlockClasses` | 启动测试 |
+| 9 | block size 与 KV 布局不匹配 | 以 262144 为主尺寸、池扩到 8GB | 联调配置 | `no-free-slots` 归 0、外部命中打通 |
+| 10 | reporter 永久卡死（两个入口） | 重基线化替代抛错 | `resource_reporter.py` | 回归测试 + 端到端首周期恢复 |
+| 11 | 三个"像链路断了"的假故障 | `__name__` 选择器 / 改名 / refId 重排 | 面板 JSON + 生成器 | 12 面板出数、序列有值 |
+| 12 | 未使用 size 恒 0 行 | sticky reveal | `7e515b8c` | 5 用例（CI）+ 三份文档同步 |
+| 13 | 两张热力图 Y 轴不统一 | 桶集统一 14 值 | `7ce12bca` | 三处镜像逐值一致 |
+| 14 | 官方 dashboard 无 drampool 面板 | 新增 `grafana_dram.json` | `649f2b8b` | 8 个面板出实时数据 |
+| 15 | 跑错二进制导致结论作废 | 按真实编译参数重建 harness | 联调 | `CLIENT_INIT=11` + 干净复跑 |
+| 16 | 日志限流低估失败规模 | 以 counter 为权威、记录开关 | 联调文档 | 840 vs 15 行对比 |
+| 17 | 指标参数变更打破测试契约 | 测试补 `kEnqueueUs=0`；clang-format | PR #3820 | 18 个改动文件 `clang-format --dry-run --Werror` 全过 + 格式化幂等 |
 
+### 3.8 从这些问题里沉淀出的两条操作纪律
+
+1. **结构化配置（Grafana JSON）的编辑必须做字节级防护**：编辑前后跑一次 `json` round-trip 比对；保留仓库既有的 CRLF；变量级联顺序（如 `slot_size` 必须插在 `worker_rank` 之后才能引用它）显式约束。否则会得到 87 行整文件 diff，评审时无法分辨哪些是语义变更。最终该文件的改动收敛到 50/37 行，全部是真实语义变更。
+2. **环境类故障要做 fail-fast 预检**：数据面故障曾只表现为难以解读的 `507001` / `503900`，且要等模型加载数分钟后才暴露。把 `hccn_tool -i N -link -g` 的全卡预检放进脚本，全 DOWN 时直接报错并给出诊断命令与通过判据——这是本次联调代价最大的一条教训，也是最容易复用的一条。
 ---
 
 ## 4. 现存问题
 
-以下均以 2026-10-16 的仓库状态（分支 `z00984767-0917`，HEAD `afdcbda6`）核验过。
+以下均以 2026-10-16 的仓库状态（分支 `z00984767-0917`，HEAD `afdcbda6`）核验过；2026-10-21 复查到 `e6717d04` 时，`ucm/store/dram/cc/drampool/` 下的埋点文件与 `ucm/shared/metrics/cc/domain/metrics.cc` **均无改动**，因此下列问题全部仍然成立（唯一的框架层变化是 `metrics.h` 的内存序修复，已见 §3.2.1）。
 
 ### 4.1 P0 — 会输出错误数字
 
@@ -708,7 +711,7 @@ panel 引用 `ucm:ucm_hit_blocks_total`，仓库与 Prometheus 中均**不存在
 
 **配套约定**
 - **bucket 从 SLA 反推，不猜**。硬规则：**最高 bucket 必须 > `opTimeoutMs`**。每个延迟类 ~10 个 bucket、每十倍频程 2–3 个。
-- **bucket 一经发布不可改**——因为改动会使 `/dev/shm` 里的持久化基线失效（这正是 §3.4-⑪ 那个卡死缺陷的触发条件，虽然已改成重基线化，但升级期仍会丢一个周期的差分）。
+- **bucket 一经发布不可改**——因为改动会使 `/dev/shm` 里的持久化基线失效（这正是 §3.4.1 那个卡死缺陷的触发条件，虽然已改成重基线化，但升级期仍会丢一个周期的差分）。
 
 **另有一处反复出现的浪费**：`task_worker.cc:52-55` 每次循环（含 100µs 空转）都重写两个常量 capacity gauge，约 **2 万次/秒**的无效 `UpdateStats`。提案把 capacity 改为 pull 模型的采样即可消除。
 
@@ -803,6 +806,8 @@ panel 引用 `ucm:ucm_hit_blocks_total`，仓库与 Prometheus 中均**不存在
 | `0fde501b` | 2026-10-15 | Move DramPool slot-used counting out of shared BufferPool |
 | `afdcbda6` | 2026-10-15 | Fix clang-format violation in CompletionPoller flag pool gauge |
 | `84423cf1` | 2026-10-15 | add DramPool documentation (#1504) |
+| `7164b731` | 2026-10-16 | [Bugfix] Fix metrics double-buffer race between writers and collector (#1520) |
+| `e6717d04` | 2026-10-20 | 当前分支 HEAD（merge upstream/develop；未触及 drampool 埋点文件） |
 
 ## 附录 C：错误码与术语
 
@@ -827,7 +832,9 @@ panel 引用 `ucm:ucm_hit_blocks_total`，仓库与 Prometheus 中均**不存在
 - **设计/联调文档**：`dramPool_documents/metrics_design.md`、`metrics_summary.md`、`metrics_summary.csv`、`e2e_retrospective_20261012.md`、`A2_VLLM_DRAMSTORE_GRAFANA_E2E_SUMMARY.md`、`a2-vllm-dramstore-drampool-grafana-z009-flickering-pascal.md`、`PR1394_FULL_CHAIN_HANDOFF.md`
 - **会话**：`4c08…9c16` 期间的 24 个主会话转录（2026-09-17 ~ 2026-10-16），其中与指标开发直接相关的为 `ca3c574f`、`dcb074f3`、`a437daed`（设计评审）、`7d189a46`（label 方案）、`308378d8`、`d3205631`（开关隔离 / CI）、`7c33b968`（A2 端到端）、`ae6d9a8e`、`06ce3935`（代码导读 / 面板解读）
 
-> **口径声明**：本文中标注为"核验"的代码结论，均由本次直接读取当前工作区文件（分支 `z00984767-0917`，HEAD `afdcbda6`）得出；标注为会话/文档来源的历史结论，已尽量交叉引用两次以上。凡两者冲突处，以代码复核结果为准。
+> **口径声明**：本文中标注为"核验"的代码结论，均由本次直接读取当前工作区文件（分支 `z00984767-0917`）得出；初版核验于 `afdcbda6`，第 3 章改写时复查于 `e6717d04`（`ucm/store/dram/cc/drampool/` 埋点文件零改动）。标注为会话/文档来源的历史结论，已尽量交叉引用两次以上。凡两者冲突处，以代码复核结果为准。
+>
+> **第 3 章的组织方式（2026-10-21 改写）**：按"现象 → 根因 → 解决 → 验证"记录 16 个有代表性的问题，而非按改动类型罗列；第 3.7 节给出一览表。改写时补入了一条此前未收录的框架修复（`7164b731`，metrics 双缓冲在 x86 上的竞争导致段错误），其验证数据取自该提交自身的压测记录。
 >
 > **本文的 12 条关键论断经过一轮对抗性复核**（每条由独立 agent 专职尝试证伪，只认代码证据）。复核结果：**8 条 CONFIRMED，4 条被修正并已回写本文**——分别是：用户文档覆盖数（10 而非 9，24% 而非 20%）、completionQueue 自旋等待的观测状态（不是"未观测"，而是被吞进 `prepare` 与 `batch_total` 且无法归因）、默认驱逐策略的实际行为（第一次 TTL 重试是真在干活，只有第二次 deep 释放 0 条目）、以及「接收线程会被 TCP 异常静默杀掉」这一条**被证伪**（该分支不可达，见 §4.2-11）。另有一处数字陷阱被澄清：会话里流传的"43 个 `drampool_*` 指标"来自 `grep -c '"drampool_'`，其中两行是 `#include "drampool_*.h"`，**真实为 41 个名字 / 40 个静态注册项**。
 >
