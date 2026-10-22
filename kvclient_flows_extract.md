@@ -480,23 +480,23 @@ flowchart TD
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: TaskManagerBase::Submit<br/>分配 TaskId
-    PENDING --> INFLIGHT: ClientTaskManager::Process<br/>或 TransportTaskExecutor::Execute
-    INFLIGHT --> COMPLETED: Finalize<br/>或 CompleteWithError<br/>或 Cancel
-    COMPLETED --> REMOVED: Wait / Drain → Remove
+    [*] --> PENDING: 分配 TaskId
+    PENDING --> INFLIGHT: Process 或 Execute
+    INFLIGHT --> COMPLETED: Finalize 或 CompleteWithError 或 Cancel
+    COMPLETED --> REMOVED: Wait 或 Drain 后 Remove
     REMOVED --> [*]
 
     note right of PENDING
-        Check → false
-        Wait → 阻塞
+        Check 返回 false
+        Wait 阻塞等待
     end note
     note right of COMPLETED
-        Check → true
-        Wait → 立即返回结果并 Remove
+        Check 返回 true
+        Wait 立即返回结果并 Remove
     end note
     note right of REMOVED
-        Check → true（无法区分“不存在”）
-        Wait → TASK_NOT_FOUND
+        Check 仍返回 true
+        Wait 返回 TASK_NOT_FOUND
     end note
 ```
 
