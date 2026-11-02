@@ -100,6 +100,41 @@
 | 全局视图 | `GlobalView` | `viewEpoch`、`viewId`、`asuMap` | `kv_semantics/src/client/view/view_server.h:38-44` |
 | 返回结果 | `TaskResult` | `status`、`entryStatus`、`queryResult` | `kv_semantics/include/kv_types.h:137-141` |
 
+#### 1.5.1 `KVBuffer` 的字段结构
+
+`KVBuffer` 是 entries 路径（Load / Store / BatchLoad / BatchStore）的最小单位，一条 entry 对应一个 key 的一次读写：
+
+```text
+KVBuffer
+├── key          : CacheKey           // 远端 value 的逻辑 key
+├── buffer
+│   ├── region
+│   │   ├── memoryType : DEVICE/HOST/HOST_PINNED
+│   │   ├── addr       : 本地虚拟地址
+│   │   ├── size       : 本地区域大小
+│   │   └── deviceId / numaNode
+│   └── handle         : MRHandle      // 客户端账本编号
+├── offset       : uint32              // value 内偏移（512B 对齐）
+└── mrKey        : optional<uint32>    // 解析后的硬件 token
+```
+
+各字段的归属与填写者：
+
+| 字段 | 属于哪一侧 | 谁填写 | 是否下发到 SQE |
+|---|---|---|---|
+| `key` | 远端 ASU | 调用方 | 是（key 字段） |
+| `buffer.region` | 本地内存 | 调用方 | 是（`buffer_addr` / `length`） |
+| `buffer.handle` | 客户端账本 | 调用方（来自 `RegisterRegions` 的返回值） | 否，只用于查 `tokenId` |
+| `offset` | 远端 value 内 | 调用方 | 是（`offset` 字段） |
+| `mrKey` | 本地内存凭证 | `KvClient::SubmitAsync` 解析 | 是（`mr_key` 字段） |
+
+注意：
+
+- 调用方传入的 `mrKey` 会被 `SubmitAsync` 无条件重置，再按 `buffer.handle` 重新解析。
+- `buffer.region.addr` 是本地地址；远端只通过 key 定位 value，不保存本地地址。
+- `offset` 是 ASU 侧 value 内的偏移，不是本地内存的偏移；本地写入从 `buffer_addr` 开始。
+- `KVBuffer` 只在 entries 路径存在；keys 路径（Query / Delete）只携带 `CacheKey`。
+
 ### 1.6 易混概念先区分
 
 | 容易混淆 | 区别 |
@@ -4257,6 +4292,30 @@ classDiagram
         +Free(slot) Status
     }
 
+    class AsuStore {
+        -vector~RegisteredPersistentRegion~ persistentRegions_
+        -mutex persistentRegionsMu_
+        +Setup(config) Status
+        -RegisterKVCaches(registrations, count) Status
+        -BuildKvBuffers(task) Expected
+        -FindPersistentHandle(region) MRHandle
+    }
+
+    class RegisteredPersistentRegion {
+        +MemoryRegion region
+        +MRHandle handle
+    }
+
+    class StoreV1 {
+        <<interface>>
+        +Load(task) TaskHandle
+        +Dump(task) TaskHandle
+    }
+
+    StoreV1 <|-- AsuStore
+    AsuStore --> RegisteredPersistentRegion
+    AsuStore ..> KvClientImpl : RegisterRegions / Submit
+
     KvClientImpl --> ProviderMemoryState
     KvClientImpl --> RegisteredMemory
     KvClientImpl --> TransProvider
@@ -4312,7 +4371,216 @@ sequenceDiagram
     Note over K: 提交任务时：mrKey = registeredRegions_[buffer.handle].tokenId
 ```
 
-### 13.3 代码：注册主流程
+### 13.3 调用方链路：从 `AsuStore::Setup` 到 `KVBuffer.buffer.handle`
+
+先给结论：**Load/Store 不会自动注册。** 调用方必须在提交前调 `RegisterRegions`，把设备内存登记到客户端账本里；提交时只做一次 `handle → tokenId` 的查表。注册发生在三个不同的层，容易混：
+
+| 层 | 谁注册 | 注册什么 | 代码位置 |
+|---|---|---|---|
+| 业务内存 | 调用方（UCM） | GPU KV buffer 的 `addr + size` | `asu_store.cc:358-397` → `kv_client_impl.cc:330-426` |
+| 客户端账本 | `KvClientImpl` | canonical handle、tokenId、每个 provider 的 local handle | `kv_client_impl.cc:330-426` |
+| transport 内部缓冲 | `AsuTransport` | send buffer、flag buffer | `trans_task_executor.cc:137-172` |
+
+第二层和第三层的代码在前面的小节；本节补的是**第一层，也就是调用方到底在哪里注册、handle 又怎么回到 `KVBuffer` 里**。
+
+#### 13.3.1 时序图：注册、反查、提交、校验
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as AsuStore
+    participant K as KvClientImpl
+    participant R as RegisterRegionsOnce
+    participant P as TransProvider
+    participant V as ValidateSqeMrKeys
+    Note over S: Setup 阶段，只做一次
+    S->>S: 用 gpu_kv_buffer_addrs/sizes 构造 MemoryRegion(DEVICE)
+    S->>K: RegisterRegions(regions, out)
+    K->>R: RegisterRegionsOnce
+    R->>P: RegisterMemory → canonical handle
+    R->>P: GetMemTokenId → tokenId
+    R->>P: BindMemory（每个 transport provider）
+    R-->>S: RegisteredMemory{region, handle, tokenId}
+    S->>S: persistentRegions_ = {region, handle}
+    Note over S: 每次 Load / Dump
+    S->>S: BuildKvBuffers：buffer.handle = FindPersistentHandle(region)
+    alt 地址不在已注册区间
+        S-->>S: 提交前返回 "outside registered persistent regions"
+    end
+    S->>K: BatchLoadAsync / BatchStoreAsync
+    K->>K: SubmitAsync：mrKey = registeredRegions_[handle].tokenId
+    K->>V: transport 构建子批时校验 mrKey
+    alt mrKey 缺失
+        V-->>K: BUFFER_NOT_REGISTERED
+    end
+```
+
+#### 13.3.2 代码：调用方注册 GPU KV 区域
+
+`ucm/store/asu/cc/asu_store.cc:358-397`
+
+```cpp
+    Status RegisterKVCaches(const KVCacheRegistration* registrations, std::size_t count)
+    {
+        if (!client_) { return Status::Error("ASU client is not initialized"); }
+
+        std::vector<kv::MemoryRegion> regions;
+        regions.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            // 【注】跳过空区域；注册粒度是整片 GPU KV buffer，不是单个 tensor。
+            if (registrations[index].addr == 0 || registrations[index].size == 0) { continue; }
+            kv::MemoryRegion region;
+            region.memoryType = kv::MemoryType::DEVICE;
+            region.addr = static_cast<std::uint64_t>(registrations[index].addr);
+            region.size = static_cast<std::uint64_t>(registrations[index].size);
+            region.deviceId = config_.deviceId;
+            regions.emplace_back(region);
+        }
+        if (regions.empty()) { return Status::OK(); }
+
+        std::vector<kv::RegisteredMemory> registeredRegions;
+        // 【注】这一步进入客户端账本：注册 + 取 token + 在已有 provider 上 bind。
+        auto status = client_->RegisterRegions(regions, registeredRegions);
+        if (!status.ok()) {
+            LogAsuStatus("register persistent regions", status);
+            return ConvertStatus(status);
+        }
+        if (registeredRegions.size() != regions.size()) {
+            return Status::Error("ASU registered region count mismatch");
+        }
+        std::vector<RegisteredPersistentRegion> registered;
+        registered.reserve(regions.size());
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            // 【注】调用方只保留 region 与 canonical handle；tokenId 留在客户端内部。
+            registered.emplace_back(RegisteredPersistentRegion{registeredRegions[index].region,
+                                                               registeredRegions[index].handle});
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(persistentRegionsMu_);
+            persistentRegions_ = std::move(registered);
+        }
+        UC_INFO("ASU registered {} persistent KV cache region(s).", regions.size());
+        return Status::OK();
+    }
+```
+
+**这一段在做什么**：UCM 在 `AsuStore::Setup` 里把 `gpu_kv_buffer_addrs/sizes` 转成 `MemoryRegion`，一次性注册给 `KvClient`，并保存返回的 canonical handle。它是"业务内存注册"的唯一入口。
+
+**重点语法 / 坑**：
+
+- 注册发生在 `Setup`（[asu_store.cc:283-296](ucm/store/asu/cc/asu_store.cc#L283-L296)），不是每次 Load/Dump。
+- 注册粒度是整片 buffer；后续 `BuildKvBuffers` 用地址区间反查 handle。
+- `addr == 0` 或 `size == 0` 的区域被静默跳过，不会报错。
+- `tokenId` 不保存在 `AsuStore`；它只在 `KvClient` 的 `registeredRegions_` 里，提交时再查。
+- 注册失败会导致 `Setup` 直接失败，并 `client_->Shutdown()` 后丢弃客户端。
+
+#### 13.3.3 代码：每次 Load/Dump 反查 handle
+
+`ucm/store/asu/cc/asu_store.cc:806-836`
+
+```cpp
+    Expected<std::vector<kv::KVBuffer>> BuildKvBuffers(const Detail::TaskDesc& task) const
+    {
+        std::vector<kv::KVBuffer> entries;
+        entries.reserve(task.size() * config_.tensorSizes.size());
+
+        for (const auto& shard : task) {
+            if (shard.index >= ShardsPerBlock()) {
+                return Status::InvalidParam("invalid shard index({})", shard.index);
+            }
+            if (shard.addrs.size() != config_.tensorSizes.size()) {
+                return Status::InvalidParam("invalid tensor addr count({})", shard.addrs.size());
+            }
+            const auto tensorOffsets = BuildTensorOffsets(shard.index);
+            for (std::size_t tensorIndex = 0; tensorIndex < shard.addrs.size(); ++tensorIndex) {
+                kv::KVBuffer entry;
+                entry.key = MakeAsuKey(shard.owner);
+                entry.buffer.region.memoryType = kv::MemoryType::DEVICE;
+                entry.buffer.region.addr =
+                    reinterpret_cast<std::uint64_t>(shard.addrs[tensorIndex]);
+                entry.buffer.region.size = config_.tensorSizes[tensorIndex];
+                entry.buffer.region.deviceId = config_.deviceId;
+                // 【注】用 tensor 的地址区间反查它落在哪一片已注册区域。
+                entry.buffer.handle = FindPersistentHandle(entry.buffer.region);
+                if (entry.buffer.handle == kv::kInvalidMRHandle) {
+                    // 【注】在提交之前就失败，不会进入 KvClient 的任务表。
+                    return Status::Error("ASU KV buffer is outside registered persistent regions");
+                }
+                entry.offset = static_cast<std::uint32_t>(tensorOffsets[tensorIndex]);
+                entries.emplace_back(std::move(entry));
+            }
+        }
+        return entries;
+    }
+```
+
+**这一段在做什么**：每次 Load/Dump 把上层 task 拆成 `KVBuffer`，并用每个 tensor 的地址区间在 `persistentRegions_` 里反查 canonical handle，最后把该 handle 填进 `entry.buffer.handle`。
+
+**重点语法 / 坑**：
+
+- 这里只**反查**，不注册；注册已经在 `Setup` 完成。
+- `FindPersistentHandle`（[asu_store.cc:860-871](ucm/store/asu/cc/asu_store.cc#L860-L871)）判断"区域完全落在某个已注册区域内"，不是简单比较起始地址。
+- 找不到 handle 会在提交前返回错误，因此调用方看不到 `BUFFER_NOT_REGISTERED`。
+- 同一个 key 的多个 tensor 生成多条 `KVBuffer`，它们共享同一个 handle、不同的 offset。
+- `buffer.region.size` 是单个 tensor 的大小，不是整片注册区域。
+
+#### 13.3.4 代码：transport 侧校验 `mrKey`
+
+`kv_semantics/src/trans/proto/sqe_request.cc:45-55`
+
+```cpp
+Status ValidateSqeMrKeys(const BatchView<KVBuffer>& entries)
+{
+    for (std::size_t index = 0; index < entries.size; ++index) {
+        // 【注】mrKey 由 SubmitAsync 从 registeredRegions_ 解析；这里只判空。
+        if (!entries[index].mrKey.has_value()) {
+            return Status::Error(
+                StatusCode::BUFFER_NOT_REGISTERED,
+                "entry buffer is not registered, entryIndex=" + std::to_string(index));
+        }
+    }
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：transport 构建 entry 子批时的最后一道校验。只要有一条 entry 的 `mrKey` 为空，整个子批在发送前失败。
+
+**重点语法 / 坑**：
+
+- `mrKey` 的来源是 `SubmitAsync` 的 `registeredRegions_.find(entry.buffer.handle)`（[kv_client_impl.cc:451-459](kv_semantics/src/client/kv_client_impl.cc#L451-L459)）。
+- 查不到时提交仍然成功；错误要等到 `Wait` 才通过 `entryStatus` 暴露。
+- 这里不检查地址范围，也不检查 handle 是否与 region 匹配；这些依赖调用方在 `BuildKvBuffers` 阶段保证。
+- keys 路径（Query/Delete）不会调用这个函数，因为不需要业务内存。
+
+#### 13.3.5 注册生命周期
+
+| 时机 | 发生什么 | 代码 |
+|---|---|---|
+| `AsuStore::Setup` | 调 `RegisterRegions`，保存 handle | `asu_store.cc:283-296,358-397` |
+| 每次 `Load`/`Dump` | `BuildKvBuffers` 用地址区间反查 handle | `asu_store.cc:806-836` |
+| `KvClient::SubmitAsync(entries)` | `handle → tokenId`，写入 `entry.mrKey` | `kv_client_impl.cc:451-459` |
+| transport 构建子批 | 校验 `mrKey` 非空 | `sqe_request.cc:45-55` |
+| 视图新增 ASU | `BuildTransport` 把已注册区域 bind 到新 provider | `kv_client_impl.cc:719-737` |
+| 调用方不再使用 | `UnregisterRegions`，逆序解绑所有 provider | `kv_client_impl.cc:575-625` |
+
+**注册与注销的硬性约束**：
+
+- 先注册、后提交。未注册的 handle 不会在提交时被拒绝，而是在 transport 侧失败。
+- 新增 ASU 会自动补绑；但如果注册时 `snapshot->transports` 为空，`RegisterRegions` 会静默返回 OK 且不记账，之后也不会补绑。
+- 注销必须在所有引用该区域的在飞任务完成之后；头文件契约见 `kv_client.h:58-59`，代码没有额外保护。
+- `Shutdown` 会绕过 `UnregisterRegions`，直接逆序注销全部 provider 映射。
+
+**失败现象对照**：
+
+| 现象 | 原因 | 发生阶段 |
+|---|---|---|
+| `ASU KV buffer is outside registered persistent regions` | tensor 地址不在任何已注册区间 | 提交前（调用方） |
+| 提交成功，`Wait` 得到 `PARTIAL_FAILED` | `entryStatus` 为 `BUFFER_NOT_REGISTERED` | transport 构建子批 |
+| `RegisterRegions` 返回 `PARTIAL_FAILED` | provider 注册/绑定/token 校验失败 | Setup |
+| `UnregisterRegions` 返回失败但 handle 仍可解析 | 部分 provider 解绑失败，映射被有意保留 | 注销 |
+
+### 13.4 代码：注册主流程
 
 `kv_semantics/src/client/kv_client_impl.cc:330-426`
 
@@ -4437,7 +4705,7 @@ Status KvClientImpl::RegisterRegionsOnce(const std::vector<MemoryRegion>& region
 - 注册时不校验 handle 是否为 0；`kInvalidMRHandle` 也会被写入账本。
 - 整个函数持有 `memoryMu_`，与 `BuildTransport` 的建连串行。
 
-### 13.4 代码：注销主流程
+### 13.5 代码：注销主流程
 
 `kv_semantics/src/client/kv_client_impl.cc:575-625`
 
@@ -4510,7 +4778,7 @@ Status KvClientImpl::UnregisterRegions(const std::vector<MRHandle>& handles)
 - `handle_count` 是过滤后的数量，不是调用方输入数量。
 - 与 `Shutdown` 的区别：`Shutdown` 不执行"是否仍被映射"的过滤，直接全部注销。
 
-### 13.5 代码：在 provider 上绑定
+### 13.6 代码：在 provider 上绑定
 
 `kv_semantics/src/client/kv_client_impl.cc:742-784`
 
@@ -4572,7 +4840,7 @@ Status KvClientImpl::BindProviderRegions(const std::shared_ptr<TransProvider>& t
 - `localHandles` 先 `clear()`，调用方传入的旧内容不会被保留。
 - 这个函数由 `BuildTransport` 在持有 `memoryMu_` 时调用；新 ASU 加入时会自动绑定当前所有已注册区域。
 
-### 13.6 代码：在 provider 上注销
+### 13.7 代码：在 provider 上注销
 
 `kv_semantics/src/client/kv_client_impl.cc:786-815`
 
@@ -4920,13 +5188,13 @@ API → ClientTask（TaskId）
 
 ## 附录：交付自检
 
-自检脚本对本文档的 69 个代码块逐一读取标注范围，删除所有新增的 `// 【注】` 行后与源码逐行比对。
+自检脚本对本文档的 72 个代码块逐一读取标注范围，删除所有新增的 `// 【注】` 行后与源码逐行比对。
 
 | 检查项 | 结果 |
 |---|---|
-| 代码块数量 | 69 |
-| 去掉新增注释后与源码逐行一致 | 69 / 69，0 mismatch |
-| ``` 围栏配平 | 192 个围栏，偶数，配平 |
+| 代码块数量 | 72 |
+| 去掉新增注释后与源码逐行一致 | 72 / 72，0 mismatch |
+| ``` 围栏配平 | 202 个围栏，偶数，配平 |
 | 每张图后紧跟该环节代码 | 第 2–13 章均满足：先类图、再时序图、随后代码 |
 | 未标注的省略 | 0（没有使用省略标记；每个块均为完整函数/职责单元） |
 | 行号包含块尾 `}` | 是 |
@@ -4938,6 +5206,7 @@ API → ClientTask（TaskId）
 - 第 1 章是概念章，只有定位图，没有代码；这是该章的结构要求，不属于功能环节。
 - 第 2–13 章是功能环节，全部遵循"类图 → 时序图 → 代码逐行讲解"。
 - 第 8–11 章是四类数据操作的专属章节：写、读、查、删。
+- 第 13.3 节补充了调用方侧的注册链路：`AsuStore::Setup → RegisterKVCaches → BuildKvBuffers → SubmitAsync → ValidateSqeMrKeys`。
 - 第 14–17 章是决策、调参、速查与总结，不含代码。
 
 
