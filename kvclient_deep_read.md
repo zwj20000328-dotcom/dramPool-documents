@@ -21,9 +21,10 @@
 | 5 | 第 5 章 传输执行 | 一个 ASU 任务怎么变成 SQE 并发出去 |
 | 6 | 第 6 章 完成与解码 | CQE 怎么变成逐条状态 |
 | 7 | 第 7 章 聚合与收割 | 三级任务怎么汇总成 `TaskResult` |
-| 8 | 第 8 章 视图刷新 | 节点变化时怎么换路由表 |
-| 9 | 第 9 章 内存注册 | buffer handle 怎么变成硬件 token |
-| 10 | 第 10-13 章 | 设计取舍、调参、速查、总结 |
+| 8 | 第 8-11 章 四类操作 | 写 / 读 / 查 / 删各自的专属路径 |
+| 9 | 第 12 章 视图刷新 | 节点变化时怎么换路由表 |
+| 10 | 第 13 章 内存注册 | buffer handle 怎么变成硬件 token |
+| 11 | 第 14-17 章 | 设计取舍、调参、速查、总结 |
 
 ### 0.2 前置知识
 
@@ -256,7 +257,7 @@ sequenceDiagram
     S-->>K: ViewSnapshot
     K->>K: taskQueue_.Setup(depth+1)
     K->>K: 启动 Client WorkerLoop
-    K->>K: snapshot_ = next; initialized_ = true
+    K->>K: snapshot_ = next，initialized_ = true
     K-->>U: OK
 ```
 
@@ -1734,7 +1735,7 @@ sequenceDiagram
             E->>E: 所有 pending 子批 = TIMEOUT
             E->>CM: ReportFailure(channel)
             E->>E: CompleteSubBatch × N
-            E->>E: finalStatus = TIMEOUT; COMPLETED
+            E->>E: finalStatus = TIMEOUT，COMPLETED
             E-->>CL: true
         else 正常轮询
             loop 每个未完成子批
@@ -2136,7 +2137,7 @@ sequenceDiagram
         alt 计数归零
             CTM->>CT: Finalize(task)
             CT->>CT: 重算 prefixHitKeys；OK / PARTIAL_FAILED
-            CT->>CT: state=COMPLETED; cv.notify_all
+            CT->>CT: state=COMPLETED，cv.notify_all
         end
     end
     U->>CTM: Wait(taskId)
@@ -2498,9 +2499,1385 @@ Status ClientTaskManager::Wait(TaskId taskId, std::uint64_t waitTimeoutMs, TaskR
 - 移除后 callback 只持有 `weak_ptr`，late completion 会被静默丢弃。
 - `Drain` 复用 `WaitContext` 但自己负责 `Remove`（`task_manager.cc:118-132`）。
 
-## 8. 视图刷新
+## 8. 写操作：Store / BatchStore
 
 ### 8.1 类图
+
+```mermaid
+classDiagram
+    class KvClient {
+        <<interface>>
+        +StoreAsync(entries, taskId) Status
+        +StoreAsync(entries, taskId, event) Status
+        +BatchStoreAsync(entries, taskId) Status
+        +BatchStoreAsync(entries, taskId, event) Status
+    }
+
+    class KvClientImpl {
+        +StoreAsync(entries, taskId) Status
+        +StoreAsync(entries, taskId, event) Status
+        +BatchStoreAsync(entries, taskId) Status
+        +BatchStoreAsync(entries, taskId, event) Status
+        -SubmitAsync(op, entries, taskId, event) Status
+    }
+
+    class ClientTask {
+        +AsuOpType opType
+        +uintptr_t prerequisiteEventHandle
+        +vector~KVBuffer~ entries
+        +vector~Status~ entryStatus
+    }
+
+    class TransportTask {
+        +NodeId nodeId
+        +AsuOpType opType
+        +vector~KVBuffer~ entries
+        +vector~size_t~ originalIndices
+    }
+
+    class TransportSubBatchContext {
+        +uint16 cid
+        +ScatterGatherEntry sendSge
+        +ScatterGatherEntry flagBuffer
+        +vector~Status~ entryStatus
+    }
+
+    class KvStoreRequest {
+        +uint16 cid
+        +uint32 kv_ns_id
+        +uint8 dtype
+        +uint8 dspec
+        +uint64 buffer_addr
+        +uint32 buffer_length
+        +uint32 mr_key
+        +uint32 offset
+        +bool lr
+        +uint32 length
+        +CacheKey key
+    }
+
+    class KvBatchStoreRequest {
+        +uint16 cid
+        +uint32 kv_ns_id
+        +uint8 dtype
+        +uint8 dspec
+        +uint64 response_buffer_addr
+        +uint32 response_mr_key
+        +bool lr
+        +bool rflag
+        +uint16 batch_number
+        +vector~KvBatchStoreEntry~ entries
+    }
+
+    class KvStoreProtocol {
+        +PackSqe(req, target) Status
+        +ValidateRequest(req) Status
+    }
+
+    class KvBatchStoreProtocol {
+        +PackSqe(req, target) Status
+        +ValidateRequest(req) Status
+    }
+
+    KvClient <|-- KvClientImpl
+    KvClientImpl --> ClientTask
+    ClientTask --> TransportTask
+    TransportTask --> TransportSubBatchContext
+    TransportTask --> KvStoreRequest
+    TransportTask --> KvBatchStoreRequest
+    KvStoreRequest --> KvStoreProtocol
+    KvBatchStoreRequest --> KvBatchStoreProtocol
+```
+
+### 8.2 时序图：一次写操作
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 调用方
+    participant K as KvClientImpl
+    participant M as ClientTaskManager
+    participant W as Client WorkerLoop
+    participant R as Router
+    participant T as AsuTransport
+    participant E as TransportTaskExecutor
+    participant P as TransProvider
+    participant L as CompletionLoop
+    U->>K: StoreAsync(entries, taskId[, event])
+    U->>K: 或 BatchStoreAsync(entries, taskId[, event])
+    K->>K: SubmitAsync：校验 opType ∈ {STORE, BATCH_STORE}
+    K->>K: memoryMu_ 下把 buffer.handle 解析成 mrKey
+    K->>M: Submit(ClientTask)
+    K-->>U: TaskId（仅表示已入队）
+    M->>W: taskQueue_ 出队
+    opt prerequisiteEventHandle != 0
+        W->>W: SynchronizeEvent（只有 Store 族能设置）
+    end
+    W->>R: ExtractEntryKeys → RouteKeys
+    R-->>W: nodeId → 原始下标
+    loop 每个 ASU
+        W->>T: Submit(TransportTask)
+    end
+    T->>E: Execute
+    alt Store（单条路径）
+        E->>E: GetSqeIoNum = 1，每条 entry 一个子批
+        E->>E: BuildStoreRequest
+        E->>E: KvStoreProtocol::PackSqe（64B）
+    else BatchStore
+        E->>E: 按 batchStoreIoNum 切子批
+        E->>E: BuildBatchStoreRequest
+        E->>E: KvBatchStoreProtocol::PackSqe（64B + 36B/entry）
+    end
+    E->>P: Send(ioBatches, kernel_count, quiet_count)
+    P-->>L: 完成写入 flag buffer
+    L->>L: PollResponseCid 匹配 cid
+    L->>L: UnpackCqe → 逐条状态
+    L->>M: CompleteTransportTask
+    M->>M: 计数归零 → Finalize
+    U->>M: Wait(taskId)
+    M-->>U: TaskResult（entryStatus 为逐条结果）
+```
+
+### 8.3 代码：StoreAsync 的带事件重载
+
+`kv_semantics/src/client/kv_client_impl.cc:259-265`
+
+```cpp
+Status KvClientImpl::StoreAsync(const std::vector<KVBuffer>& entries, TaskId& taskId,
+                                std::uintptr_t eventHandle)
+{
+    // 【注】写操作是唯一支持前置事件的重载：先等设备事件，再由 worker 处理。
+    auto status = SubmitAsync(AsuOpType::STORE, entries, taskId, eventHandle);
+    RecordSubmit(AsuOpType::STORE, entries.size(), status);
+    return status;
+}
+```
+
+**这一段在做什么**：写操作的公共入口。它把事件句柄原样交给 `SubmitAsync`，事件会在 client worker 线程上被同步；提交结果只表示入队成功。
+
+**重点语法 / 坑**：
+
+- `eventHandle` 只影响"何时开始处理"，不影响路由与 SQE 内容。
+- `RecordSubmit` 在提交返回后立即记录请求数/条目数；失败时额外记 errors。
+- 这里没有校验 `entries` 是否为空；空数组会成功入队并走零路由的快捷路径。
+
+### 8.4 代码：StoreAsync 的无事件重载
+
+`kv_semantics/src/client/kv_client_impl.cc:267-270`
+
+```cpp
+Status KvClientImpl::StoreAsync(const std::vector<KVBuffer>& entries, TaskId& taskId)
+{
+    // 【注】无事件重载只是把 eventHandle 设为 0；worker 会跳过 SynchronizeEvent。
+    return StoreAsync(entries, taskId, 0);
+}
+```
+
+**这一段在做什么**：把两参数调用转发给三参数重载，事件句柄固定为 0。
+
+**重点语法 / 坑**：
+
+- 0 被 `WorkerLoop` 解释为"没有前置事件"，不是"等待一个句柄为 0 的事件"。
+- 这个转发意味着两个重载的行为差异只有一个分支。
+
+### 8.5 代码：BatchStoreAsync 的带事件重载
+
+`kv_semantics/src/client/kv_client_impl.cc:279-285`
+
+```cpp
+Status KvClientImpl::BatchStoreAsync(const std::vector<KVBuffer>& entries, TaskId& taskId,
+                                     std::uintptr_t eventHandle)
+{
+    // 【注】与 StoreAsync 的唯一区别是 op type：走批量 SQE 编解码与 batchStoreIoNum 切分。
+    auto status = SubmitAsync(AsuOpType::BATCH_STORE, entries, taskId, eventHandle);
+    RecordSubmit(AsuOpType::BATCH_STORE, entries.size(), status);
+    return status;
+}
+```
+
+**这一段在做什么**：批量写入口。仍然是同一条 `SubmitAsync` 管线，但 op type 决定后续切分粒度与 SQE 形态。
+
+**重点语法 / 坑**：
+
+- `BATCH_STORE` 使用 `batchStoreIoNum`（默认 110），不是单条路径的 1。
+- 事件语义与单条写完全一致，并在同一个 client worker 上阻塞等待。
+- 批量写失败时顶层仍是 `PARTIAL_FAILED`，逐条原因看 `entryStatus`。
+
+### 8.6 代码：BatchStoreAsync 的无事件重载
+
+`kv_semantics/src/client/kv_client_impl.cc:287-290`
+
+```cpp
+Status KvClientImpl::BatchStoreAsync(const std::vector<KVBuffer>& entries, TaskId& taskId)
+{
+    // 【注】同样只是补一个 0 事件句柄。
+    return BatchStoreAsync(entries, taskId, 0);
+}
+```
+
+**这一段在做什么**：批量写的两参数重载，转发并填充 `eventHandle=0`。
+
+**重点语法 / 坑**：
+
+- 没有任何额外状态；两个重载共用同一个 `ClientTask` 结构。
+- 如果调用方需要"等上游拷贝完成再写"，必须用三参数重载。
+
+### 8.7 代码：构建单条写请求
+
+`kv_semantics/src/trans/proto/sqe_request.cc:196-213`
+
+```cpp
+KvStoreRequest BuildStoreRequest(const KVBuffer& entry,
+                                 const std::unordered_map<std::string, std::string>& attrs,
+                                 std::uint16_t cid)
+{
+    KvStoreRequest request;
+    request.cid = cid;
+    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
+    // 【注】dtype/dspec 是 Store 独有的类型描述，客户端只透传、不解释。
+    request.dtype = GetTransportConfigAttr<std::uint8_t>(attrs, "dtype");
+    request.dspec = GetTransportConfigAttr<std::uint8_t>(attrs, "dspec");
+    request.buffer_addr = entry.buffer.region.addr;
+    request.buffer_length = static_cast<std::uint32_t>(entry.buffer.region.size);
+    request.mr_key = *entry.mrKey;
+    request.offset = entry.offset;
+    request.lr = GetTransportConfigAttr<bool>(attrs, "lr");
+    // 【注】没有 per-entry 长度字段：传输长度就是整段注册区域的大小。
+    request.length = request.buffer_length;
+    request.key = entry.key;
+    return request;
+}
+```
+
+**这一段在做什么**：把一条 `KVBuffer` 转成单条写请求。地址、长度、token、offset、key 全部来自条目；`kv_ns_id` / `dtype` / `dspec` / `lr` 来自 transport 配置。
+
+**重点语法 / 坑**：
+
+- `mr_key` 直接解引用 `optional`；调用前必须已经通过 `ValidateSqeMrKeys`。
+- `buffer_length` 与 `length` 被设为同一个值：写入整段区域，不能只写一部分。
+- `dtype` 只有 3 位、`dspec` 只有 5 位，非法值会在打包校验时被拒绝。
+- `kv_ns_id` 缺失时取 0；FAWA 场景必须由上层正确配置。
+
+### 8.8 代码：构建批量写请求
+
+`kv_semantics/src/trans/proto/sqe_request.cc:169-194`
+
+```cpp
+KvBatchStoreRequest BuildBatchStoreRequest(
+    const BatchView<KVBuffer>& entries, const std::unordered_map<std::string, std::string>& attrs,
+    std::uint16_t cid, const ScatterGatherEntry& flagBuffer)
+{
+    KvBatchStoreRequest request;
+    request.cid = cid;
+    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
+    request.dtype = GetTransportConfigAttr<std::uint8_t>(attrs, "dtype");
+    request.dspec = GetTransportConfigAttr<std::uint8_t>(attrs, "dspec");
+    // 【注】批量写必须带回执缓冲：整体状态与逐条结果都写在这里。
+    request.response_buffer_addr = flagBuffer.device_addr;
+    request.response_mr_key = flagBuffer.tokenId;
+    request.lr = GetTransportConfigAttr<bool>(attrs, "lr");
+    request.rflag = true;
+    request.batch_number = static_cast<std::uint16_t>(entries.size);
+    request.entries.reserve(entries.size);
+    for (std::size_t index = 0; index < entries.size; ++index) {
+        KvBatchStoreEntry entry;
+        entry.key = entries[index].key;
+        entry.offset = entries[index].offset;
+        entry.buffer_addr = entries[index].buffer.region.addr;
+        entry.mr_key = *entries[index].mrKey;
+        entry.length = static_cast<std::uint32_t>(entries[index].buffer.region.size);
+        request.entries.emplace_back(std::move(entry));
+    }
+    return request;
+}
+```
+
+**这一段在做什么**：把一批 `KVBuffer` 转成批量写请求：一个 header + N 个 36 字节条目，并携带回执缓冲区地址与 token。
+
+**重点语法 / 坑**：
+
+- `rflag=true` 表示要求硬件写回执；单条写不设置这个位。
+- `batch_number` 是 `uint16_t`，但协议校验上限是 110；转换本身不会截断到 110。
+- 每条 entry 的 `length` 同样是整段注册区域大小。
+- `flagBuffer` 的 token 来自 transport 自己的缓冲注册，不是调用方的业务内存 token。
+
+### 8.9 代码：单条写的 SQE 打包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:162-181`
+
+```cpp
+Status KvStoreProtocol::PackSqe(const SqeRequest& req, std::uint32_t* target)
+{
+    auto& r = static_cast<const KvStoreRequest&>(req);
+    auto status = ValidateRequest(r);
+    if (!status.ok()) { return status; }
+
+    // 【注】dword0：cid 在高 16 位，opcode 在低位，单条写不设 rflag。
+    target[0] = (r.cid << 16) | (kFixedBits << 14) | static_cast<std::uint32_t>(KvOpcode::Store);
+    target[1] = r.kv_ns_id;
+    target[2] = ((r.dtype & 0x7) << 13) | ((r.dspec & 0x1F) << 8);
+    target[6] = r.buffer_addr & 0xFFFFFFFFULL;
+    target[7] = (r.buffer_addr >> 32) & 0xFFFFFFFFULL;
+    // 【注】长度只有 24 位；mr_key 被拆到 dword8 与 dword9。
+    target[8] = ((r.mr_key & 0xFF) << 24) | (r.buffer_length & 0xFFFFFF);
+    target[9] =
+        (static_cast<std::uint32_t>(DptrType::Standard) << 24) | ((r.mr_key >> 8) & 0xFFFFFF);
+    target[10] = r.offset;
+    target[11] = (r.lr ? (1U << 31) : 0) | (r.length & 0xFFFFFF);
+
+    std::memcpy(&target[12], r.key.data(), kCacheKeySizeBytes);
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：把单条写请求按位打包成固定 16 dword（64 字节）的 SQE：cid/opcode、命名空间、类型描述、buffer 地址、token、offset、长度、8 字节 key。
+
+**重点语法 / 坑**：
+
+- `buffer_length` / `length` 都被截到 24 位；超过 `0xFFFFFF` 会在 `ValidateRequest` 先被拒绝。
+- `mr_key` 的低 8 位与长度共享 dword8，高 24 位与 DptrType 共享 dword9；拼装错误会导致设备读错内存。
+- key 固定拷贝 8 字节，不做变长编码。
+- `target` 的容量必须至少 64 字节；由 send buffer 槽位保证。
+
+### 8.10 代码：批量写的 SQE 打包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:440-463`
+
+```cpp
+Status KvBatchStoreProtocol::PackSqe(const SqeRequest& req, std::uint32_t* target)
+{
+    auto& r = static_cast<const KvBatchStoreRequest&>(req);
+    auto status = ValidateRequest(r);
+    if (!status.ok()) { return status; }
+
+    target[0] =
+        (r.cid << 16) | (kFixedBits << 14) | static_cast<std::uint32_t>(KvOpcode::BatchStore);
+    // 【注】批量写设置 rflag：完成状态与逐条结果由 flag buffer 回传。
+    if (r.rflag) { target[0] |= (1U << 13); }
+    target[1] = r.kv_ns_id;
+    target[2] = ((r.dtype & 0x7) << 13) | ((r.dspec & 0x1F) << 8);
+    target[3] = r.response_buffer_addr & 0xFFFFFFFFULL;
+    target[4] = (r.response_buffer_addr >> 32) & 0xFFFFFFFFULL;
+    target[5] = r.response_mr_key;
+    // 【注】dword8 是条目区总字节数（N × 36），不是条目数。
+    target[8] = r.batch_number * kBatchEntrySizeBytes;
+    target[9] = static_cast<std::uint32_t>(DptrType::Batch) << 24;
+    target[10] = r.batch_number;
+    if (r.lr) { target[11] |= (1U << 31); }
+
+    for (std::size_t i = 0; i < r.batch_number; ++i) {
+        // 【注】每个条目固定 36 字节（9 个 dword），紧跟在 16 dword 头之后。
+        PackEntry(r.entries[i], target + kSqeDwordCount + i * kBatchEntryDwordCount);
+    }
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：打包批量写 SQE：固定 64 字节头 + 每条 36 字节条目。头部携带回执缓冲地址与 token；条目区总长度由 `batch_number × 36` 计算。
+
+**重点语法 / 坑**：
+
+- `batch_number` 上限是 110；`PackedSize` 用同一个公式计算，二者必须一致。
+- `target[8]` 是**字节数**，`target[10]` 才是条目数；这两个字段不能互换。
+- `rflag` 不设置时硬件不会写回执，完成轮询会永远等不到 cid。
+- `lr` 只设置 dword11 的最高位，其余位由条目打包填充。
+
+### 8.11 写操作的关键分支
+
+| 分支 | 行为 |
+|---|---|
+| `StoreAsync` 带非 0 event | worker 先 `SynchronizeEvent`，失败则整单 `CompleteWithError` |
+| `StoreAsync` 带 0 event | 跳过事件同步，直接路由 |
+| `entries` 为空 | 提交成功；零路由，直接 `Finalize` 为 OK |
+| `buffer.handle` 未注册 | 提交成功；transport 构建时报 `BUFFER_NOT_REGISTERED` |
+| 单条写 | `ioNum=1`，N 条 = N 个 SQE/cid/flag buffer |
+| 批量写 | `ioNum=batchStoreIoNum`，N 条 = `ceil(N/ioNum)` 个 SQE |
+| 批量写部分条目失败 | 子批状态 `0x732`，逐条 `ENTRY_*`，顶层 `PARTIAL_FAILED` |
+
+**易错点**：
+
+- 单条写不设 `rflag`，但仍分配 flag buffer 并轮询 CQE 头。
+- 写操作的 `length` 永远是整段注册区域，不能只写其中一段。
+- `dtype` / `dspec` 只透传；仓库内没有定义它们的取值语义。
+
+## 9. 读操作：Load / BatchLoad
+
+### 9.1 类图
+
+```mermaid
+classDiagram
+    class KvClient {
+        <<interface>>
+        +LoadAsync(entries, taskId) Status
+        +BatchLoadAsync(entries, taskId) Status
+    }
+
+    class KvClientImpl {
+        +LoadAsync(entries, taskId) Status
+        +BatchLoadAsync(entries, taskId) Status
+        -SubmitAsync(op, entries, taskId, event) Status
+    }
+
+    class ClientTask {
+        +AsuOpType opType
+        +vector~KVBuffer~ entries
+        +vector~Status~ entryStatus
+    }
+
+    class TransportTask {
+        +AsuOpType opType
+        +vector~KVBuffer~ entries
+    }
+
+    class KvRetrieveRequest {
+        +uint16 cid
+        +uint32 kv_ns_id
+        +uint64 buffer_addr
+        +uint32 buffer_length
+        +uint32 mr_key
+        +uint32 offset
+        +bool lr
+        +uint32 length
+        +CacheKey key
+    }
+
+    class KvBatchRetrieveRequest {
+        +uint16 cid
+        +uint32 kv_ns_id
+        +uint64 response_buffer_addr
+        +uint32 response_mr_key
+        +bool lr
+        +bool rflag
+        +uint16 batch_number
+        +vector~KvBatchRetrieveEntry~ entries
+    }
+
+    class KvRetrieveProtocol {
+        +PackSqe(req, target) Status
+        +ValidateRequest(req) Status
+    }
+
+    class KvBatchRetrieveProtocol {
+        +PackSqe(req, target) Status
+        +ValidateRequest(req) Status
+    }
+
+    KvClient <|-- KvClientImpl
+    KvClientImpl --> ClientTask
+    ClientTask --> TransportTask
+    TransportTask --> KvRetrieveRequest
+    TransportTask --> KvBatchRetrieveRequest
+    KvRetrieveRequest --> KvRetrieveProtocol
+    KvBatchRetrieveRequest --> KvBatchRetrieveProtocol
+```
+
+### 9.2 时序图：一次读操作
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 调用方
+    participant K as KvClientImpl
+    participant M as ClientTaskManager
+    participant W as Client WorkerLoop
+    participant R as Router
+    participant T as AsuTransport
+    participant E as TransportTaskExecutor
+    participant P as TransProvider
+    participant L as CompletionLoop
+    U->>K: LoadAsync(entries, taskId)
+    U->>K: 或 BatchLoadAsync(entries, taskId)
+    K->>K: SubmitAsync：校验 opType ∈ {LOAD, BATCH_LOAD}
+    K->>K: memoryMu_ 下解析 mrKey
+    K->>M: Submit(ClientTask)
+    K-->>U: TaskId
+    M->>W: taskQueue_ 出队
+    Note over W: 读操作没有 eventHandle 重载，跳过事件同步
+    W->>R: ExtractEntryKeys → RouteKeys
+    R-->>W: nodeId → 原始下标
+    W->>T: Submit(TransportTask)
+    T->>E: Execute
+    alt Load（单条路径）
+        E->>E: GetSqeIoNum = 1
+        E->>E: BuildRetrieveRequest
+        E->>E: KvRetrieveProtocol::PackSqe
+    else BatchLoad
+        E->>E: 按 batchLoadIoNum 切子批
+        E->>E: BuildBatchRetrieveRequest
+        E->>E: KvBatchRetrieveProtocol::PackSqe
+    end
+    E->>P: Send(ioBatches, kernel_count, quiet_count)
+    P-->>L: 数据写入目标 buffer，回执写 flag buffer
+    L->>L: cid 匹配 → UnpackCqe
+    L->>L: 逐条状态回填
+    L->>M: CompleteTransportTask
+    M->>M: Finalize
+    U->>M: Wait(taskId)
+    M-->>U: TaskResult
+```
+
+### 9.3 代码：LoadAsync
+
+`kv_semantics/src/client/kv_client_impl.cc:252-257`
+
+```cpp
+Status KvClientImpl::LoadAsync(const std::vector<KVBuffer>& entries, TaskId& taskId)
+{
+    // 【注】读操作没有 eventHandle 参数：接口层就不允许等前置设备事件。
+    auto status = SubmitAsync(AsuOpType::LOAD, entries, taskId);
+    RecordSubmit(AsuOpType::LOAD, entries.size(), status);
+    return status;
+}
+```
+
+**这一段在做什么**：单条读入口。它复用 entries 路径的 `SubmitAsync`，事件句柄使用默认值 0。
+
+**重点语法 / 坑**：
+
+- `SubmitAsync` 的 `eventHandle` 默认参数在头文件声明（`kv_client_impl.h:117`），这里只传三个参数。
+- 读操作与写操作共享路由、任务树与结果回填，差异只在下游的请求构造与 SQE。
+- 读回来的数据直接写入 `buffer.region.addr` 指向的内存，调用方必须保证该区域已注册且有效。
+
+### 9.4 代码：BatchLoadAsync
+
+`kv_semantics/src/client/kv_client_impl.cc:272-277`
+
+```cpp
+Status KvClientImpl::BatchLoadAsync(const std::vector<KVBuffer>& entries, TaskId& taskId)
+{
+    // 【注】批量读同样没有事件重载；切分粒度由 batchLoadIoNum 决定。
+    auto status = SubmitAsync(AsuOpType::BATCH_LOAD, entries, taskId);
+    RecordSubmit(AsuOpType::BATCH_LOAD, entries.size(), status);
+    return status;
+}
+```
+
+**这一段在做什么**：批量读入口。op type 决定后续使用批量 SQE 与 `batchLoadIoNum` 切分。
+
+**重点语法 / 坑**：
+
+- `BATCH_LOAD` 的结果缓冲是 4 bit/entry；单条 `LOAD` 没有逐条结果缓冲。
+- 批量读的单条失败只体现在 `entryStatus`，顶层是 `PARTIAL_FAILED`。
+- 读操作永远不会改变 `queryResult`；`Wait` 返回的 `queryResult` 为 `nullopt`。
+
+### 9.5 代码：构建单条读请求
+
+`kv_semantics/src/trans/proto/sqe_request.cc:215-230`
+
+```cpp
+KvRetrieveRequest BuildRetrieveRequest(const KVBuffer& entry,
+                                       const std::unordered_map<std::string, std::string>& attrs,
+                                       std::uint16_t cid)
+{
+    KvRetrieveRequest request;
+    request.cid = cid;
+    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
+    request.buffer_addr = entry.buffer.region.addr;
+    request.buffer_length = static_cast<std::uint32_t>(entry.buffer.region.size);
+    request.mr_key = *entry.mrKey;
+    request.offset = entry.offset;
+    request.lr = GetTransportConfigAttr<bool>(attrs, "lr");
+    request.length = request.buffer_length;
+    request.key = entry.key;
+    return request;
+}
+```
+
+**这一段在做什么**：把一条 `KVBuffer` 转成单条读请求。与写请求相比，**没有 `dtype` / `dspec`**，其余字段一一对应。
+
+**重点语法 / 坑**：
+
+- 读请求的 `buffer_addr` 是**目标内存**，不是源内存。
+- `offset` 是 ASU 侧 value 内的偏移；`length` 是要读的字节数。
+- 读请求同样要求 512B 对齐与 24 位长度上限，校验逻辑在 `ValidateRequest`（`kv_protocol.cc:322-360`）。
+- 缺少 `dtype` / `dspec` 是读与写最直接的协议差异。
+
+### 9.6 代码：构建批量读请求
+
+`kv_semantics/src/trans/proto/sqe_request.cc:232-255`
+
+```cpp
+KvBatchRetrieveRequest BuildBatchRetrieveRequest(
+    const BatchView<KVBuffer>& entries, const std::unordered_map<std::string, std::string>& attrs,
+    std::uint16_t cid, const ScatterGatherEntry& flagBuffer)
+{
+    KvBatchRetrieveRequest request;
+    request.cid = cid;
+    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
+    // 【注】批量读必须带响应缓冲：完成状态与逐条结果写回这里。
+    request.response_buffer_addr = flagBuffer.device_addr;
+    request.response_mr_key = flagBuffer.tokenId;
+    request.lr = GetTransportConfigAttr<bool>(attrs, "lr");
+    request.rflag = true;
+    request.batch_number = static_cast<std::uint16_t>(entries.size);
+    request.entries.reserve(entries.size);
+    for (std::size_t index = 0; index < entries.size; ++index) {
+        KvBatchRetrieveEntry entry;
+        entry.key = entries[index].key;
+        entry.offset = entries[index].offset;
+        entry.buffer_addr = entries[index].buffer.region.addr;
+        entry.mr_key = *entries[index].mrKey;
+        entry.length = static_cast<std::uint32_t>(entries[index].buffer.region.size);
+        request.entries.emplace_back(std::move(entry));
+    }
+    return request;
+}
+```
+
+**这一段在做什么**：把一批 `KVBuffer` 转成批量读请求：一个 header + N 个条目，携带回执缓冲。
+
+**重点语法 / 坑**：
+
+- 与批量写相比，`dtype` / `dspec` 不存在；因此对应 SQE dword2 保持 0。
+- `response_buffer_addr` 必须是设备可见地址；`local_addr` 只用于 CPU 轮询。
+- 每个条目的 `buffer_addr` 是各自的目标内存，允许不同条目指向不同区域。
+- `batch_number` 的协议上限是 110。
+
+### 9.7 代码：单条读的 SQE 打包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:302-320`
+
+```cpp
+Status KvRetrieveProtocol::PackSqe(const SqeRequest& req, std::uint32_t* target)
+{
+    auto& r = static_cast<const KvRetrieveRequest&>(req);
+    auto status = ValidateRequest(r);
+    if (!status.ok()) { return status; }
+
+    // 【注】opcode 是 Retrieve(0x2)；与 Store 不同，这里不写 dtype/dspec。
+    target[0] = (r.cid << 16) | (kFixedBits << 14) | static_cast<std::uint32_t>(KvOpcode::Retrieve);
+    target[1] = r.kv_ns_id;
+    target[6] = r.buffer_addr & 0xFFFFFFFFULL;
+    target[7] = (r.buffer_addr >> 32) & 0xFFFFFFFFULL;
+    target[8] = ((r.mr_key & 0xFF) << 24) | (r.buffer_length & 0xFFFFFF);
+    target[9] =
+        (static_cast<std::uint32_t>(DptrType::Standard) << 24) | ((r.mr_key >> 8) & 0xFFFFFF);
+    target[10] = r.offset;
+    target[11] = (r.lr ? (1U << 31) : 0) | (r.length & 0xFFFFFF);
+
+    std::memcpy(&target[12], r.key.data(), kCacheKeySizeBytes);
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：打包单条读 SQE。布局与单条写几乎一致，唯一区别是 opcode，以及 dword2（dtype/dspec）不被写入。
+
+**重点语法 / 坑**：
+
+- dword2 的零值依赖 `BufferManager` 在分配/释放时清零槽位，而不是打包器显式写 0。
+- 地址、token、长度、offset、key 的位布局与写完全相同。
+- 读操作不设置 `rflag`，也不写响应地址；完成 CQE 仍从 transport 分配的 flag buffer 读取。
+
+### 9.8 代码：批量读的 SQE 打包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:641-663`
+
+```cpp
+Status KvBatchRetrieveProtocol::PackSqe(const SqeRequest& req, std::uint32_t* target)
+{
+    auto& r = static_cast<const KvBatchRetrieveRequest&>(req);
+    auto status = ValidateRequest(r);
+    if (!status.ok()) { return status; }
+
+    target[0] =
+        (r.cid << 16) | (kFixedBits << 14) | static_cast<std::uint32_t>(KvOpcode::BatchRetrieve);
+    // 【注】批量读设置 rflag，要求硬件把逐条结果写入 flag buffer。
+    if (r.rflag) { target[0] |= (1U << 13); }
+    target[1] = r.kv_ns_id;
+    target[3] = r.response_buffer_addr & 0xFFFFFFFFULL;
+    target[4] = (r.response_buffer_addr >> 32) & 0xFFFFFFFFULL;
+    target[5] = r.response_mr_key;
+    target[8] = r.batch_number * kBatchEntrySizeBytes;
+    target[9] = static_cast<std::uint32_t>(DptrType::Batch) << 24;
+    target[10] = r.batch_number;
+    if (r.lr) { target[11] |= (1U << 31); }
+
+    for (std::size_t i = 0; i < r.batch_number; ++i) {
+        PackEntry(r.entries[i], target + kSqeDwordCount + i * kBatchEntryDwordCount);
+    }
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：打包批量读 SQE。头布局与批量写一致，但没有 dword2 的类型描述；条目区仍是每条 36 字节。
+
+**重点语法 / 坑**：
+
+- 与批量写的唯一头部差异是 dword2 不写；读没有 dtype/dspec。
+- `target[8]` 是条目区字节数，`target[10]` 是条目数。
+- `PackedSize` 与 `batch_number` 必须匹配，否则校验失败、整个 transport task 在发送前中止。
+- 批量读的逐条结果由 4-bit result buffer 表示，解码在完成轮询阶段。
+
+### 9.9 读操作的关键分支
+
+| 分支 | 行为 |
+|---|---|
+| `LoadAsync` | `ioNum=1`，N 条 = N 个 SQE/cid/flag buffer |
+| `BatchLoadAsync` | `ioNum=batchLoadIoNum`，N 条 = `ceil(N/ioNum)` 个 SQE |
+| 读操作带事件 | 不存在这个入口；`LoadAsync`/`BatchLoadAsync` 都没有 eventHandle 参数 |
+| 目标 buffer 未注册 | `BUFFER_NOT_REGISTERED`，子批在发送前失败 |
+| 批量读部分条目失败 | 子批状态 `0x732`，逐条 `ENTRY_*`，顶层 `PARTIAL_FAILED` |
+| 单条读失败 | CQE 状态直接复制给该条 entry，没有逐条结果缓冲 |
+
+**易错点**：
+
+- 读与写共用 `KVBuffer`，但 `buffer_addr` 的语义相反：写是源，读是目标。
+- 读操作没有 `dtype`/`dspec`；不要从写请求的结构推断读请求也有。
+- 批量读只有 4-bit 结果缓冲；单条读连逐条缓冲都没有。
+
+## 10. 查操作：Query
+
+### 10.1 类图
+
+```mermaid
+classDiagram
+    class KvClient {
+        <<interface>>
+        +QueryAsync(keys, taskId) Status
+    }
+
+    class KvClientImpl {
+        +QueryAsync(keys, taskId) Status
+        -SubmitAsync(op, keys, taskId) Status
+    }
+
+    class ClientTask {
+        +AsuOpType opType
+        +vector~CacheKey~ keys
+        +QueryResult queryResult
+        +vector~Status~ entryStatus
+    }
+
+    class QueryResult {
+        +vector~uint8~ exists
+        +uint32 prefixHitKeys
+    }
+
+    class TransportTask {
+        +AsuOpType opType
+        +vector~CacheKey~ keys
+    }
+
+    class TransportSubBatchContext {
+        +uint16 cid
+        +bool useSeekControl
+        +ScatterGatherEntry flagBuffer
+        +vector~Status~ entryStatus
+    }
+
+    class KvExistRequest {
+        +uint16 cid
+        +uint32 kv_ns_id
+        +uint64 response_buffer_addr
+        +uint32 response_mr_key
+        +bool rflag
+        +bool sc
+        +vector~CacheKey~ keys
+        +uint16 batch_number
+    }
+
+    class KvResponse {
+        +uint16 cid
+        +uint16 status
+        +uint16 existing_key_number
+        +vector~uint8~ result_buffer
+    }
+
+    class KvExistProtocol {
+        +PackSqe(req, target) Status
+        +UnpackCqe(data, batch, out) Status
+    }
+
+    KvClient <|-- KvClientImpl
+    KvClientImpl --> ClientTask
+    ClientTask --> QueryResult
+    ClientTask --> TransportTask
+    TransportTask --> TransportSubBatchContext
+    TransportTask --> KvExistRequest
+    KvExistRequest --> KvExistProtocol
+    KvExistProtocol --> KvResponse
+```
+
+### 10.2 时序图：一次查询
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 调用方
+    participant K as KvClientImpl
+    participant M as ClientTaskManager
+    participant W as Client WorkerLoop
+    participant R as Router
+    participant T as AsuTransport
+    participant E as TransportTaskExecutor
+    participant P as TransProvider
+    participant L as CompletionLoop
+    U->>K: QueryAsync(keys, taskId)
+    K->>K: SubmitAsync(keys)：opType 必须是 QUERY
+    K->>K: queryResult.exists.assign(keys.size(), 0)
+    K->>M: Submit(ClientTask)
+    K-->>U: TaskId
+    M->>W: taskQueue_ 出队
+    Note over W: Query 没有 eventHandle，跳过事件同步
+    W->>R: RouteKeys(8 字节 key)
+    R-->>W: nodeId → 原始下标
+    W->>T: Submit(TransportTask)
+    T->>E: Execute
+    E->>E: 按 queryIoNum(默认 256) 切子批
+    E->>E: BuildExistRequest(sc)
+    E->>E: KvExistProtocol::PackSqe
+    E->>P: Send(ioBatches)
+    P-->>L: 存在性结果写 flag buffer
+    L->>L: cid 匹配 → UnpackCqe
+    L->>L: existing_key_number + 1-bit result buffer
+    L->>L: FillEntryStatusFromCqeResult
+    alt sc=true（默认）
+        L->>L: 逐 key 位图 → ENTRY_KEY_EXIST / ENTRY_KEY_NOT_EXIST
+    else sc=false
+        L->>L: 前 N 条 = 存在，其余 = 不存在
+    end
+    L->>L: CQE_CHECK_RESULT_BUFFER 归一化为 OK
+    L->>M: CompleteTransportTask
+    M->>M: transport OK 时才合并 exists
+    M->>M: Finalize 重算 prefixHitKeys
+    U->>M: Wait(taskId)
+    M-->>U: TaskResult.status=OK，queryResult 给出命中和前缀命中数
+```
+
+### 10.3 代码：QueryAsync
+
+`kv_semantics/src/client/kv_client_impl.cc:244-250`
+
+```cpp
+Status KvClientImpl::QueryAsync(const std::vector<CacheKey>& keys, TaskId& taskId)
+{
+    auto status = SubmitAsync(AsuOpType::QUERY, keys, taskId);
+    RecordSubmit(AsuOpType::QUERY, keys.size(), status);
+    // 【注】查询是唯一在“提交失败”时就可能触发视图刷新的数据 API。
+    if (IsRefreshNeeded(status)) { RequestBackgroundRefresh(); }
+    return status;
+}
+```
+
+**这一段在做什么**：查询入口。它提交 keys 路径任务、记录指标，并在提交状态命中刷新白名单时请求一次后台视图刷新。
+
+**重点语法 / 坑**：
+
+- 提交失败也可能意味着路由/连接过期，所以这里比其他数据 API 多一个刷新分支。
+- `SubmitAsync(keys)` 会预分配 `exists`；查询结果顺序由 `originalIndices` 还原。
+- `QueryAsync` 没有 `eventHandle` 参数，永远不会等待设备事件。
+
+### 10.4 代码：构建 Exist 请求
+
+`kv_semantics/src/trans/proto/sqe_request.cc:282-296`
+
+```cpp
+KvExistRequest BuildExistRequest(const BatchView<CacheKey>& keys,
+                                 const std::unordered_map<std::string, std::string>& attrs,
+                                 std::uint16_t cid, const ScatterGatherEntry& flagBuffer)
+{
+    KvExistRequest request;
+    request.cid = cid;
+    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
+    // 【注】查询必须带回执缓冲：存在性结果写在这里。
+    request.response_buffer_addr = flagBuffer.device_addr;
+    request.response_mr_key = flagBuffer.tokenId;
+    request.rflag = true;
+    // 【注】sc 默认 true：逐 key 位图；false 时只回前导命中数。
+    request.sc = GetTransportConfigAttr<bool>(attrs, "sc", true);
+    request.keys = CopyKeys(keys);
+    request.batch_number = static_cast<std::uint16_t>(request.keys.size());
+    return request;
+}
+```
+
+**这一段在做什么**：把一批 key 转成 Exist 请求。它只携带 key 列表、命名空间、回执缓冲和 `sc` 标志，不涉及任何业务内存。
+
+**重点语法 / 坑**：
+
+- `sc` 缺失时默认 `true`；这是与 `existing_key_number` 路径的开关。
+- 查询不需要 `mrKey`，也不需要调用方注册 buffer。
+- `batch_number` 的协议上限是 256，比批读写的 110 更宽。
+- 回执缓冲的 token 来自 transport 自己的 flag buffer 注册。
+
+### 10.5 代码：Exist SQE 打包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:982-1003`
+
+```cpp
+Status KvExistProtocol::PackSqe(const SqeRequest& req, std::uint32_t* target)
+{
+    auto& r = static_cast<const KvExistRequest&>(req);
+    auto status = ValidateRequest(r);
+    if (!status.ok()) { return status; }
+
+    target[0] = (r.cid << 16) | (kFixedBits << 14) | static_cast<std::uint32_t>(KvOpcode::Exist);
+    if (r.rflag) { target[0] |= (1U << 13); }
+    target[1] = r.kv_ns_id;
+    target[3] = r.response_buffer_addr & 0xFFFFFFFFULL;
+    target[4] = (r.response_buffer_addr >> 32) & 0xFFFFFFFFULL;
+    target[5] = r.response_mr_key;
+    target[8] = r.batch_number * kKeyEntrySizeBytes;
+    target[9] = static_cast<std::uint32_t>(DptrType::Batch) << 24;
+    target[10] = r.batch_number;
+    // 【注】sc 位在 dword10 的 bit16；它决定回执的解释方式。
+    if (r.sc) { target[10] |= (1U << 16); }
+
+    for (std::size_t i = 0; i < r.batch_number; ++i) {
+        PackEntry(r.keys[i], target + kSqeDwordCount + i * kKeyEntryDwordCount);
+    }
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：打包 Exist SQE：头 + N 个 16 字节 key 条目。`sc` 位与 `batch_number` 共处 dword10。
+
+**重点语法 / 坑**：
+
+- `target[8]` 是 key 区字节数（N × 16），`target[10]` 是 key 数。
+- `sc` 只占 bit16；修改 `batch_number` 时不要覆盖这一位。
+- 查询不携带 value、offset、mr_key；它只问"这些 key 在不在"。
+- 批量上限 256，超过会在 `ValidateRequest` 中失败。
+
+### 10.6 代码：Exist CQE 解包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:1053-1060`
+
+```cpp
+Status KvExistProtocol::UnpackCqe(const std::uint32_t* data, std::uint16_t batch_number,
+                                  KvResponse& out) const
+{
+    UnpackCqeBase(data, out);
+    // 【注】前导命中数在 dword0 的低 16 位，只在 sc=false 时被使用。
+    out.existing_key_number = data[0] & 0xFFFF;
+    // 【注】sc=true 的逐 key 结果从 dword4 起，每 key 1 bit。
+    UnpackResultBuffer1Bit(data + kCqeDwordCount, batch_number, out.result_buffer);
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：解包 Exist 回执：基础 cid/status、前导命中数、逐 key 1-bit 结果位图。
+
+**重点语法 / 坑**：
+
+- 两个结果字段都会解出来，选哪一个由 `useSeekControl`（即 `sc`）在状态回填阶段决定。
+- `existing_key_number` 是"前 N 个 key 存在"，不是任意位置的存在集合。
+- 位图长度是 `ceil(N/8)` 字节，读取时按 `batch_number` 截断。
+- 解包本身不判断是否存在；它只把原始数据搬到 `KvResponse`。
+
+### 10.7 代码：查询的逐条状态
+
+`kv_semantics/src/trans/utils/trans_task_utils.cc:139-167`
+
+```cpp
+void FillEntryStatusFromCqeResult(const KvResponse& response, AsuOpType opType, bool useSeekControl,
+                                  Status& status, std::vector<Status>& entryStatus)
+{
+    const auto keyExist = Status::Error(StatusCode::ENTRY_KEY_EXIST, "key exist");
+    const auto keyNotExist = Status::Error(StatusCode::ENTRY_KEY_NOT_EXIST, "key not exist");
+    const bool isQuery = opType == AsuOpType::QUERY;
+
+    if (status.ok()) {
+        // 【注】CQE 整体成功时，查询的每一条都视为存在。
+        std::fill(entryStatus.begin(), entryStatus.end(), isQuery ? keyExist : Status::OK());
+        return;
+    }
+
+    if (isQuery && !useSeekControl && status.code == StatusCode::CQE_CHECK_RESULT_BUFFER) {
+        // 【注】sc=false：只有前导命中数，前 N 条视为存在，其余不存在。
+        const auto existingKeyCount =
+            std::min(entryStatus.size(), static_cast<std::size_t>(response.existing_key_number));
+        std::fill(entryStatus.begin(), entryStatus.end(), keyNotExist);
+        std::fill_n(entryStatus.begin(), existingKeyCount, keyExist);
+        return;
+    }
+
+    if (status.code != StatusCode::CQE_CHECK_RESULT_BUFFER || response.result_buffer.empty()) {
+        // 【注】没有逐条位图时，整批共享同一个状态。
+        std::fill(entryStatus.begin(), entryStatus.end(), status);
+        return;
+    }
+
+    for (std::size_t index = 0; index < entryStatus.size(); ++index) {
+        // 【注】sc=true：逐 key 位图，1 = 存在，0 = 不存在。
+        entryStatus[index] = ResultBufferEntryToStatus(opType, response.result_buffer[index]);
+    }
+}
+```
+
+**这一段在做什么**：把查询回执展开成逐 key 状态。三条路径分别是：整体成功、`sc=false` 的前导命中、`sc=true` 的逐 key 位图。
+
+**重点语法 / 坑**：
+
+- `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` 是非 OK 的 `StatusCode`，但它们是**查询结果**，不是失败。
+- `isQuery && status.ok()` 时所有 key 都判存在；这是硬件没有返回位图时的约定。
+- `existing_key_number` 超过条目数时用 `min` 截断，不会越界。
+- `result_buffer` 为空时退化为整批同一状态。
+- 非 Query 操作不会进入前两个查询分支。
+
+### 10.8 查询结果在 client 层的合并
+
+查询的 `exists` 合并发生在 `CompleteTransportTask`（`kv_semantics/src/client/task/task_manager.cc:177-192`），有三个必须知道的行为：
+
+- 只有 `completionStatus.ok()` 时才合并该 transport task 的 `exists`；失败分片保持提交时预分配的 0。
+- `exists.size()` 必须等于该 transport task 的 `originalIndices.size()`，否则整个分片判为 `INTERNAL_ERROR`。
+- `Finalize` 会基于合并后的调用方顺序重算 `prefixHitKeys`（`task_manager.cc:232-238`），覆盖 transport 层算出的局部值。
+
+### 10.9 查操作的关键分支
+
+| 分支 | 行为 |
+|---|---|
+| `sc=true`（默认） | 逐 key 1-bit 位图 → `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` |
+| `sc=false` | 忽略位图，前 `existing_key_number` 条判存在 |
+| CQE 状态为 `0x732` | 归一化为 OK，查询未命中不算任务失败 |
+| 无命中 | `TaskResult.status=OK`，`exists` 全 0，`prefixHitKeys=0` |
+| 部分命中 | `TaskResult.status=OK`，逐条状态区分存在/不存在 |
+| transport 分片失败 | 该分片的 `exists` 不合并，保持初始 0 |
+| 空 key 数组 | 零路由，直接 OK，`exists` 为空 |
+
+**易错点**：
+
+- 不要把 `TaskResult.status.ok()` 当作"所有 key 都命中"；命中情况必须看 `queryResult.exists`。
+- `prefixHitKeys` 是连续前缀命中，不是总命中数。
+- `sc=false` 依赖"存在项是前缀"这一假设；非连续存在时结果会错。
+
+## 11. 删操作：Delete
+
+### 11.1 类图
+
+```mermaid
+classDiagram
+    class KvClient {
+        <<interface>>
+        +DeleteAsync(keys, taskId) Status
+    }
+
+    class KvClientImpl {
+        +DeleteAsync(keys, taskId) Status
+        -SubmitAsync(op, keys, taskId) Status
+    }
+
+    class ClientTask {
+        +AsuOpType opType
+        +vector~CacheKey~ keys
+        +vector~Status~ entryStatus
+        +QueryResult queryResult
+    }
+
+    class TransportTask {
+        +AsuOpType opType
+        +vector~CacheKey~ keys
+    }
+
+    class TransportSubBatchContext {
+        +uint16 cid
+        +ScatterGatherEntry sendSge
+        +ScatterGatherEntry flagBuffer
+        +vector~Status~ entryStatus
+    }
+
+    class KvDeleteRequest {
+        +uint16 cid
+        +uint32 kv_ns_id
+        +uint64 response_buffer_addr
+        +uint32 response_mr_key
+        +bool rflag
+        +vector~CacheKey~ keys
+        +uint16 batch_number
+    }
+
+    class KvResponse {
+        +uint16 cid
+        +uint16 status
+        +vector~uint8~ result_buffer
+    }
+
+    class KvDeleteProtocol {
+        +PackSqe(req, target) Status
+        +UnpackCqe(data, batch, out) Status
+    }
+
+    KvClient <|-- KvClientImpl
+    KvClientImpl --> ClientTask
+    ClientTask --> TransportTask
+    TransportTask --> TransportSubBatchContext
+    TransportTask --> KvDeleteRequest
+    KvDeleteRequest --> KvDeleteProtocol
+    KvDeleteProtocol --> KvResponse
+```
+
+### 11.2 时序图：一次删除
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 调用方
+    participant K as KvClientImpl
+    participant M as ClientTaskManager
+    participant W as Client WorkerLoop
+    participant R as Router
+    participant T as AsuTransport
+    participant E as TransportTaskExecutor
+    participant P as TransProvider
+    participant L as CompletionLoop
+    U->>K: DeleteAsync(keys, taskId)
+    K->>K: SubmitAsync(keys)：opType 必须是 DELETE
+    K->>K: entryStatus=n*OK；queryResult.exists 长度 0
+    K->>M: Submit(ClientTask)
+    K-->>U: TaskId
+    M->>W: taskQueue_ 出队
+    Note over W: Delete 没有 eventHandle，也不需要 mrKey
+    W->>R: RouteKeys(8 字节 key)
+    R-->>W: nodeId → 原始下标
+    W->>T: Submit(TransportTask)
+    T->>E: Execute
+    E->>E: 按 deleteIoNum(默认 254) 切子批
+    E->>E: BuildDeleteRequest
+    E->>E: KvDeleteProtocol::PackSqe
+    E->>P: Send(ioBatches)
+    P-->>L: 删除结果写 flag buffer
+    L->>L: cid 匹配 → UnpackCqe
+    L->>L: 1-bit result per key
+    L->>L: raw 1 → ENTRY_DELETE_FAILED(0x0201)
+    L->>L: 0x732 对 Delete 不归一化
+    L->>M: CompleteTransportTask
+    M->>M: Finalize：有任何子批非 OK 即 PARTIAL_FAILED
+    U->>M: Wait(taskId)
+    M-->>U: TaskResult（queryResult=nullopt）
+```
+
+### 11.3 代码：DeleteAsync
+
+`kv_semantics/src/client/kv_client_impl.cc:292-297`
+
+```cpp
+Status KvClientImpl::DeleteAsync(const std::vector<CacheKey>& keys, TaskId& taskId)
+{
+    // 【注】删除走 keys 路径：不解析 mrKey，也不需要调用方注册任何 buffer。
+    auto status = SubmitAsync(AsuOpType::DELETE, keys, taskId);
+    RecordSubmit(AsuOpType::DELETE, keys.size(), status);
+    return status;
+}
+```
+
+**这一段在做什么**：删除入口。它复用 keys 路径的 `SubmitAsync`，只携带 key 列表；没有事件、没有内存、没有查询结果。
+
+**重点语法 / 坑**：
+
+- `SubmitAsync(keys)` 会为 DELETE 预分配长度为 0 的 `queryResult.exists`。
+- 删除不检查 `buffer.handle`，因此不会出现 `BUFFER_NOT_REGISTERED`。
+- 与其他数据 API 不同，提交失败不会在这里触发视图刷新。
+
+### 11.4 代码：构建 Delete 请求
+
+`kv_semantics/src/trans/proto/sqe_request.cc:267-280`
+
+```cpp
+KvDeleteRequest BuildDeleteRequest(const BatchView<CacheKey>& keys,
+                                   const std::unordered_map<std::string, std::string>& attrs,
+                                   std::uint16_t cid, const ScatterGatherEntry& flagBuffer)
+{
+    KvDeleteRequest request;
+    request.cid = cid;
+    request.kv_ns_id = GetTransportConfigAttr<std::uint32_t>(attrs, "kv_ns_id");
+    // 【注】删除必须带回执缓冲：整体状态与逐 key 结果写在这里。
+    request.response_buffer_addr = flagBuffer.device_addr;
+    request.response_mr_key = flagBuffer.tokenId;
+    request.rflag = true;
+    request.keys = CopyKeys(keys);
+    request.batch_number = static_cast<std::uint16_t>(request.keys.size());
+    return request;
+}
+```
+
+**这一段在做什么**：把一批 key 转成 Delete 请求。它只有 key 列表、命名空间与回执缓冲，没有 value、offset、dtype 或 sc。
+
+**重点语法 / 坑**：
+
+- `CopyKeys` 会复制 key；与 entries 路径的 move 不同，这里的 key 生命周期独立于 transport task。
+- `rflag=true` 是必须的：删除的逐 key 结果依赖回执缓冲。
+- `batch_number` 协议上限是 254。
+- 没有 `lr` 字段；删除不能携带长度提示。
+
+### 11.5 代码：Delete SQE 打包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:832-852`
+
+```cpp
+Status KvDeleteProtocol::PackSqe(const SqeRequest& req, std::uint32_t* target)
+{
+    auto& r = static_cast<const KvDeleteRequest&>(req);
+    auto status = ValidateRequest(r);
+    if (!status.ok()) { return status; }
+
+    target[0] = (r.cid << 16) | (kFixedBits << 14) | static_cast<std::uint32_t>(KvOpcode::Delete);
+    if (r.rflag) { target[0] |= (1U << 13); }
+    target[1] = r.kv_ns_id;
+    target[3] = r.response_buffer_addr & 0xFFFFFFFFULL;
+    target[4] = (r.response_buffer_addr >> 32) & 0xFFFFFFFFULL;
+    target[5] = r.response_mr_key;
+    target[8] = r.batch_number * kKeyEntrySizeBytes;
+    target[9] = static_cast<std::uint32_t>(DptrType::Batch) << 24;
+    target[10] = r.batch_number;
+
+    for (std::size_t i = 0; i < r.batch_number; ++i) {
+        // 【注】每个 key 条目 16 字节：8 字节 key + 8 字节保留零。
+        PackEntry(r.keys[i], target + kSqeDwordCount + i * kKeyEntryDwordCount);
+    }
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：打包 Delete SQE：头 + N 个 16 字节 key 条目。没有 value 描述、没有 `sc` 位、没有 `lr` 位。
+
+**重点语法 / 坑**：
+
+- `target[8]` 是 key 区字节数（N × 16），`target[10]` 是 key 数。
+- 与 Query 相比，dword10 没有 `sc` 位；Delete 不使用前导命中语义。
+- `PackEntry` 只拷贝 8 字节 key，后 8 字节保留位由槽位清零保证。
+- 批量上限 254，超过在 `ValidateRequest` 中失败。
+
+### 11.6 代码：Delete CQE 解包
+
+`kv_semantics/src/trans/proto/kv_protocol.cc:902-908`
+
+```cpp
+Status KvDeleteProtocol::UnpackCqe(const std::uint32_t* data, std::uint16_t batch_number,
+                                   KvResponse& out) const
+{
+    UnpackCqeBase(data, out);
+    // 【注】每个 key 1 bit：0 成功、1 失败。
+    UnpackResultBuffer1Bit(data + kCqeDwordCount, batch_number, out.result_buffer);
+    return Status::OK();
+}
+```
+
+**这一段在做什么**：解包 Delete 回执：基础 cid/status + 每个 key 1 bit 的结果位图。
+
+**重点语法 / 坑**：
+
+- 不解析 `existing_key_number`；Delete 没有这个字段语义。
+- 位图长度是 `ceil(N/8)` 字节。
+- 解包不判断成功失败；逐 key 映射在状态回填阶段完成。
+- 若 CQE 整体状态非 0 且没有位图，所有 key 共享该状态。
+
+### 11.7 代码：entry 状态码基址
+
+`kv_semantics/src/trans/utils/trans_task_utils.cc:36-48`
+
+```cpp
+StatusCode EntryStatusCode(AsuOpType opType, std::uint8_t rawResult)
+{
+    if (opType == AsuOpType::BATCH_STORE || opType == AsuOpType::BATCH_LOAD) {
+        return static_cast<StatusCode>(kAsuBatchEntryStatusBase | rawResult);
+    }
+    if (opType == AsuOpType::DELETE) {
+        // 【注】Delete 的基址是 0x0200：raw 1 → 0x0201 = ENTRY_DELETE_FAILED。
+        return static_cast<StatusCode>(kAsuDeleteEntryStatusBase | rawResult);
+    }
+    if (opType == AsuOpType::QUERY) {
+        return static_cast<StatusCode>(kAsuExistEntryStatusBase | rawResult);
+    }
+    return rawResult == 0 ? StatusCode::OK : StatusCode::IO_ERROR;
+}
+```
+
+**这一段在做什么**：把原始的逐条结果值与操作类型组合成 `StatusCode`。三种批量操作的基址分别是 `0x0100`、`0x0200`、`0x0300`。
+
+**重点语法 / 坑**：
+
+- 基址通过按位或组合，因此 raw 值必须落在低 8 位。
+- Delete 的 raw 1 是 `ENTRY_DELETE_FAILED`；raw 0 在 `ResultBufferEntryToStatus` 中提前返回 OK。
+- 单条 Store/Retrieve 没有 result buffer，走最后的 `rawResult == 0 ? OK : IO_ERROR`。
+
+### 11.8 代码：逐条结果映射
+
+`kv_semantics/src/trans/utils/trans_task_utils.cc:55-100`
+
+```cpp
+Status ResultBufferEntryToStatus(AsuOpType opType, std::uint8_t rawResult)
+{
+    // 【注】非 Query 的 0 直接表示成功；Query 的 0 表示“不存在”。
+    if (opType != AsuOpType::QUERY && rawResult == 0x00) { return Status::OK(); }
+
+    if (opType == AsuOpType::BATCH_STORE || opType == AsuOpType::BATCH_LOAD) {
+        switch (EntryStatusCode(opType, rawResult)) {
+            case StatusCode::ENTRY_RETRY_ADVISED:
+                return Status::Error(StatusCode::ENTRY_RETRY_ADVISED,
+                                     "general error, retry advised");
+            case StatusCode::ENTRY_NO_RETRY_ADVISED:
+                return Status::Error(StatusCode::ENTRY_NO_RETRY_ADVISED,
+                                     "general error, no retry advised");
+            case StatusCode::ENTRY_KEY_NOT_FOUND:
+                return Status::Error(StatusCode::ENTRY_KEY_NOT_FOUND, "key not found");
+            case StatusCode::ENTRY_DATA_NOT_EXIST:
+                return Status::Error(StatusCode::ENTRY_DATA_NOT_EXIST, "data not exist");
+            default:
+                return Status::Error(StatusCode::IO_ERROR, "unknown ASU entry key result is " +
+                                                               std::to_string(rawResult));
+        }
+    }
+
+    if (opType == AsuOpType::DELETE) {
+        switch (EntryStatusCode(opType, rawResult)) {
+            case StatusCode::ENTRY_DELETE_FAILED:
+                return Status::Error(StatusCode::ENTRY_DELETE_FAILED, "delete failed");
+            default:
+                return Status::Error(StatusCode::IO_ERROR,
+                                     "unknown ASU delete result is " + std::to_string(rawResult));
+        }
+    }
+
+    if (opType == AsuOpType::QUERY) {
+        switch (EntryStatusCode(opType, rawResult)) {
+            case StatusCode::ENTRY_KEY_NOT_EXIST:
+                return Status::Error(StatusCode::ENTRY_KEY_NOT_EXIST, "key not exist");
+            case StatusCode::ENTRY_KEY_EXIST:
+                return Status::Error(StatusCode::ENTRY_KEY_EXIST, "key exist");
+            default:
+                return Status::Error(StatusCode::IO_ERROR,
+                                     "unknown ASU exist result is " + std::to_string(rawResult));
+        }
+    }
+
+    return Status::Error(StatusCode::IO_ERROR, "entry CQE status is " + std::to_string(rawResult));
+}
+```
+
+**这一段在做什么**：把一个 4-bit/1-bit 的原始结果值映射成逐条 `Status`。它按操作类型分成批读写、Delete、Query 三套映射。
+
+**重点语法 / 坑**：
+
+- Delete 只认 raw 0（提前返回 OK）与 raw 1（`ENTRY_DELETE_FAILED`）；其他值一律 `IO_ERROR`。
+- Query 的 raw 0 不是成功，而是 `ENTRY_KEY_NOT_EXIST`；raw 1 是 `ENTRY_KEY_EXIST`。
+- 批读写的 raw 值带有"建议重试/不建议重试"的语义。
+- 未知值不保留原码，只放进 message。
+
+### 11.9 删操作的关键分支
+
+| 分支 | 行为 |
+|---|---|
+| CQE 整体成功（0x00） | 所有 key 逐条 OK |
+| CQE 为 `0x732` 且有位图 | raw 0 → OK；raw 1 → `ENTRY_DELETE_FAILED`；其他 → `IO_ERROR` |
+| CQE 为非 0 且不是 `0x732` | 所有 key 共享该 CQE 状态 |
+| `0x732` 无位图 | 所有 key 得到 `0x732` 本身 |
+| 任一子批非 OK | transport task `PARTIAL_FAILED` → client `PARTIAL_FAILED` |
+| 空 key 数组 | 零路由，直接 OK |
+| UCM 调用 | `AsuStore` 从不调用 Delete；只有 kv-test 与单测使用 |
+
+**易错点**：
+
+- `CQE_CHECK_RESULT_BUFFER` 对 Delete **不归一化为 OK**，因此只要有一个 key 删除失败，整批就是 `PARTIAL_FAILED`。
+- 删除不返回 `queryResult`，`Wait` 结果是 `nullopt`。
+- 删除不需要注册 buffer，也不会因为 `buffer.handle` 未注册而失败。
+- 删除没有淘汰/GC 语义；它只是对给定 key 的一次显式删除。
+
+
+
+
+## 12. 视图刷新
+
+### 12.1 类图
 
 ```mermaid
 classDiagram
@@ -2557,7 +3934,7 @@ classDiagram
     ViewSnapshot --> GlobalView
 ```
 
-### 8.2 时序图：触发、重建、发布
+### 12.2 时序图：触发、重建、发布
 
 ```mermaid
 sequenceDiagram
@@ -2594,7 +3971,7 @@ sequenceDiagram
     R->>K: refreshInProgress_ = false
 ```
 
-### 8.3 代码：发布判据
+### 12.3 代码：发布判据
 
 `kv_semantics/src/client/view/view_server.cc:122-127`
 
@@ -2617,7 +3994,7 @@ bool ViewServer::ShouldPublishView(const GlobalView& publishedView,
 - 比较发生在发布快照前，且会做两次以应对并发刷新。
 - 这里的 bool 返回值在 `RefreshView` 中直接决定"是否提前返回"。
 
-### 8.4 代码：刷新触发判据
+### 12.4 代码：刷新触发判据
 
 `kv_semantics/src/client/view/view_server.cc:129-139`
 
@@ -2664,7 +4041,7 @@ bool ViewServer::ShouldRefreshView(const TaskResult& result) const
 - `std::any_of` 短路：找到第一个命中就停止。
 - 只有 `StatusCode` 参与判断，`message` 不影响结果。
 
-### 8.5 代码：默认视图源
+### 12.5 代码：默认视图源
 
 `kv_semantics/src/client/view/view_server.cc:148-158`
 
@@ -2693,7 +4070,7 @@ std::shared_ptr<ViewServer> CreateDefaultViewServer(const KvClientConfig& config
 - `ConfigBackedViewServer` 的视图来自非空的 `transportConfigs`（`Init` 已拒绝空配置），所以该后端下 `asuMap` 不会为空。
 - 文件视图每次刷新都会重新打开文件，没有缓存与 mtime 检查。
 
-### 8.6 代码：重建并发布
+### 12.6 代码：重建并发布
 
 `kv_semantics/src/client/kv_client_impl.cc:817-863`
 
@@ -2763,7 +4140,7 @@ Status KvClientImpl::RefreshView()
 - 刷新失败不会回滚 `BuildSnapshot` 已追加到 `providerMemoryStates_` 的条目。
 - `oldSnapshot` 是函数开头拷贝的；如果并发刷新已替换 `snapshot_`，这次重建可能基于较旧的旧快照，但发布前的版本判断会兜底。
 
-### 8.7 代码：后台刷新调度
+### 12.7 代码：后台刷新调度
 
 `kv_semantics/src/client/kv_client_impl.cc:865-885`
 
@@ -2825,9 +4202,9 @@ void KvClientImpl::JoinBackgroundRefresh()
 - 如果刷新线程卡在 `GetGlobalView` 的文件 IO 上，`Shutdown` 会一直等它。
 - 移出后成员为空，重复调用是安全的。
 
-## 9. 内存注册与 handle 映射
+## 13. 内存注册与 handle 映射
 
-### 9.1 类图
+### 13.1 类图
 
 ```mermaid
 classDiagram
@@ -2888,7 +4265,7 @@ classDiagram
     BufferManager --> TransProvider : 由 transport 注册
 ```
 
-### 9.2 时序图：注册与绑定
+### 13.2 时序图：注册与绑定
 
 ```mermaid
 sequenceDiagram
@@ -2935,7 +4312,7 @@ sequenceDiagram
     Note over K: 提交任务时：mrKey = registeredRegions_[buffer.handle].tokenId
 ```
 
-### 9.3 代码：注册主流程
+### 13.3 代码：注册主流程
 
 `kv_semantics/src/client/kv_client_impl.cc:330-426`
 
@@ -3060,7 +4437,7 @@ Status KvClientImpl::RegisterRegionsOnce(const std::vector<MemoryRegion>& region
 - 注册时不校验 handle 是否为 0；`kInvalidMRHandle` 也会被写入账本。
 - 整个函数持有 `memoryMu_`，与 `BuildTransport` 的建连串行。
 
-### 9.4 代码：注销主流程
+### 13.4 代码：注销主流程
 
 `kv_semantics/src/client/kv_client_impl.cc:575-625`
 
@@ -3133,7 +4510,7 @@ Status KvClientImpl::UnregisterRegions(const std::vector<MRHandle>& handles)
 - `handle_count` 是过滤后的数量，不是调用方输入数量。
 - 与 `Shutdown` 的区别：`Shutdown` 不执行"是否仍被映射"的过滤，直接全部注销。
 
-### 9.5 代码：在 provider 上绑定
+### 13.5 代码：在 provider 上绑定
 
 `kv_semantics/src/client/kv_client_impl.cc:742-784`
 
@@ -3195,7 +4572,7 @@ Status KvClientImpl::BindProviderRegions(const std::shared_ptr<TransProvider>& t
 - `localHandles` 先 `clear()`，调用方传入的旧内容不会被保留。
 - 这个函数由 `BuildTransport` 在持有 `memoryMu_` 时调用；新 ASU 加入时会自动绑定当前所有已注册区域。
 
-### 9.6 代码：在 provider 上注销
+### 13.6 代码：在 provider 上注销
 
 `kv_semantics/src/client/kv_client_impl.cc:786-815`
 
@@ -3242,9 +4619,9 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - 只返回第一个失败；调用方无法知道具体哪些 handle 失败。
 - 这个函数不修改任何账本；账本的删除由调用者决定。
 
-## 10. 设计决策：为什么这么写，代价是什么
+## 14. 设计决策：为什么这么写，代价是什么
 
-### 10.1 异步提交 + 显式 Wait，而不是回调
+### 14.1 异步提交 + 显式 Wait，而不是回调
 
 **做法**：6 个 API 都只返回 `TaskId`，结果通过 `Check` / `Wait` 获取。
 
@@ -3255,7 +4632,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - 超时后任务被移除，后台继续跑但结果丢失。
 - 调用方必须自己管理"提交了多少、什么时候收割"。
 
-### 10.2 每个客户端只有一个分发 worker
+### 14.2 每个客户端只有一个分发 worker
 
 **做法**：`KvClientImpl::WorkerLoop` 单线程处理 `taskQueue_`，并且 `producerMu_` 把提交串行化。
 
@@ -3266,7 +4643,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - `prerequisiteEventHandle` 的同步等待会阻塞所有排队任务（队头阻塞）。
 - 提高吞吐只能靠"一次提交更多条"，不能靠多线程猛调 API。
 
-### 10.3 不可变 `ViewSnapshot` + `shared_ptr`
+### 14.3 不可变 `ViewSnapshot` + `shared_ptr`
 
 **做法**：每次视图变化构造一份全新的 `ViewSnapshot`，任务在提交时钉住当时那份；旧 transport 用 `shared_ptr` 保活。
 
@@ -3277,7 +4654,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - 快照只能整体替换，不能增量更新。
 - 视图与 transport 配置解耦后，已有节点地址变化不会重建 transport。
 
-### 10.4 三级任务树 + `originalIndices`
+### 14.4 三级任务树 + `originalIndices`
 
 **做法**：`ClientTask → TransportTask → TransportSubBatch`，每一级都保留逐条状态，最终按原始下标回填。
 
@@ -3288,7 +4665,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - 客户端最终状态被压缩成 `OK` / `PARTIAL_FAILED`，真实错误码需要调用方自己看 `entryStatus`。
 - 任务对象生命周期长，`Wait` 不移除就会留在表里。
 
-### 10.5 轮询完成，而不是中断/回调
+### 14.5 轮询完成，而不是中断/回调
 
 **做法**：每个 transport 一个 `CompletionLoop`，读取 flag buffer 的 cid 判断完成。
 
@@ -3300,7 +4677,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - `GetAll()` 每轮复制任务表，任务多时开销明显。
 - cid 是唯一的配对依据，分配器必须保证不回绕到 0。
 
-### 10.6 逐条状态是一等公民
+### 14.6 逐条状态是一等公民
 
 **做法**：`TaskResult.entryStatus` 与输入等长；`QueryResult.exists` 也是逐条位图。
 
@@ -3311,7 +4688,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - `PARTIAL_FAILED` 的聚合语义会掩盖原始错误码。
 - 调用方必须理解"Query 未命中不是任务失败"。
 
-### 10.7 两层 handle 映射
+### 14.7 两层 handle 映射
 
 **做法**：`memoryProvider_` 产生 canonical handle；每个 transport provider 通过 `BindMemory` 产生自己的 local handle；两层映射分别保存在 `registeredRegions_` 与 `ProviderMemoryState.regionHandles`。
 
@@ -3322,7 +4699,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 - 部分失败时映射可能残留，语义是"宁可保留也不误删"。
 - 新增 ASU 时要补绑全部已注册区域，建连与注册互相阻塞（同一把 `memoryMu_`）。
 
-### 10.8 不做重试
+### 14.8 不做重试
 
 **做法**：任何失败都只上报状态；`ENTRY_RETRY_ADVISED` / `ENTRY_NO_RETRY_ADVISED` 只是建议。
 
@@ -3334,9 +4711,9 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 
 ---
 
-## 11. 参数与调优
+## 15. 参数与调优
 
-### 11.1 客户端参数
+### 15.1 客户端参数
 
 | 参数 | 默认值 | 作用 | 实际使用位置 |
 |---|---|---|---|
@@ -3348,7 +4725,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 | `attrs["view.config_path"]` | 空 | 显式视图配置文件 | `view_server.cc:150-153` |
 | `attrs["router.type"]` | `RING_HASH` | 路由策略 | `config_utils.cc:161-174` |
 
-### 11.2 传输参数
+### 15.2 传输参数
 
 | 参数 | 默认值 | 作用 | 备注 |
 |---|---|---|---|
@@ -3372,7 +4749,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 | `attrs["lr"]` | false | 长度/保留位 | 透传 |
 | `attrs["sc"]` | true | Query 的前导命中控制 | true 走逐 key 位图 |
 
-### 11.3 未被使用的字段
+### 15.3 未被使用的字段
 
 以下字段在 `TransportConfig` 中声明，但在当前 `src/` 下没有任何读取点：
 
@@ -3384,7 +4761,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 | `preconnect` | 无引用 |
 | `bindCqPoller` | 无引用 |
 
-### 11.4 调优建议
+### 15.4 调优建议
 
 | 现象 | 优先检查 | 调整 |
 |---|---|---|
@@ -3400,9 +4777,9 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 
 ---
 
-## 12. 速查表
+## 16. 速查表
 
-### 12.1 想改 X，改哪里
+### 16.1 想改 X，改哪里
 
 | 想改的东西 | 位置 |
 |---|---|
@@ -3427,7 +4804,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 | 重试 | 客户端不实现；上层依据 `ENTRY_RETRY_ADVISED` 决策 |
 | 取消 | `AsuTransport::Cancel`（best-effort）；`KvClient` 无取消 API |
 
-### 12.2 错误码
+### 16.2 错误码
 
 **通用状态**
 
@@ -3476,7 +4853,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 | `0x731` | `CQE_RESOURCE_BUSY` | 资源忙 |
 | `0x732` | `CQE_CHECK_RESULT_BUFFER` | 批量结果在 result buffer 中 |
 
-### 12.3 文件清单
+### 16.3 文件清单
 
 | 文件 | 一句话 |
 |---|---|
@@ -3502,7 +4879,7 @@ Status KvClientImpl::UnregisterProviderRegions(const std::shared_ptr<TransProvid
 
 ---
 
-## 13. 一页纸总结
+## 17. 一页纸总结
 
 **定位**：KvClient 是远端 KV 存储节点的异步批量客户端。它不含缓存策略、压缩、重试与服务端实现。
 
@@ -3543,23 +4920,25 @@ API → ClientTask（TaskId）
 
 ## 附录：交付自检
 
-自检脚本对本文档的 44 个代码块逐一读取标注范围，删除所有新增的 `// 【注】` 行后与源码逐行比对。
+自检脚本对本文档的 69 个代码块逐一读取标注范围，删除所有新增的 `// 【注】` 行后与源码逐行比对。
 
 | 检查项 | 结果 |
 |---|---|
-| 代码块数量 | 44 |
-| 去掉新增注释后与源码逐行一致 | 44 / 44，0 mismatch |
-| ``` 围栏配平 | 126 个围栏，偶数，配平 |
-| 每张图后紧跟该环节代码 | 第 2–9 章均满足：先类图、再时序图、随后代码 |
+| 代码块数量 | 69 |
+| 去掉新增注释后与源码逐行一致 | 69 / 69，0 mismatch |
+| ``` 围栏配平 | 192 个围栏，偶数，配平 |
+| 每张图后紧跟该环节代码 | 第 2–13 章均满足：先类图、再时序图、随后代码 |
 | 未标注的省略 | 0（没有使用省略标记；每个块均为完整函数/职责单元） |
 | 行号包含块尾 `}` | 是 |
+| Mermaid 时序图分号 | 0 处（`;` 会被 `sequenceDiagram` 当作语句分隔符） |
 | 同一概念用词 | 全文统一：`ClientTask` / `TransportTask` / `TransportSubBatch` / canonical handle / provider-local handle |
 
 说明：
 
 - 第 1 章是概念章，只有定位图，没有代码；这是该章的结构要求，不属于功能环节。
-- 第 2–9 章是功能环节，全部遵循"类图 → 时序图 → 代码逐行讲解"。
-- 第 10–13 章是决策、调参、速查与总结，不含代码。
+- 第 2–13 章是功能环节，全部遵循"类图 → 时序图 → 代码逐行讲解"。
+- 第 8–11 章是四类数据操作的专属章节：写、读、查、删。
+- 第 14–17 章是决策、调参、速查与总结，不含代码。
 
 
 
